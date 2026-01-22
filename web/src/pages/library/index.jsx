@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import {
   Button,
   Card,
@@ -9,11 +9,17 @@ import {
   List,
   message,
   Modal,
+  Radio,
   Select,
   Space,
+  Switch,
   Table,
+  Tooltip,
+  Tag,
 } from 'antd'
+import { QuestionCircleOutlined } from '@ant-design/icons'
 import {
+  createAnimeEntry,
   deleteAnime,
   getAllEpisode,
   getAnimeDetail,
@@ -27,13 +33,23 @@ import {
   getTvdbSearch,
   refreshPoster,
   setAnimeDetail,
+  toggleSourceFavorite,
+  toggleSourceIncremental,
 } from '../../apis'
 import { MyIcon } from '@/components/MyIcon'
 import { DANDAN_TYPE_DESC_MAPPING, DANDAN_TYPE_MAPPING } from '../../configs'
 import dayjs from 'dayjs'
 import { useNavigate } from 'react-router-dom'
+import { CreateAnimeModal } from '../../components/CreateAnimeModal'
+import { IncrementalRefreshModal } from '../../components/IncrementalRefreshModal'
 import { RoutePaths } from '../../general/RoutePaths'
 import { padStart } from 'lodash'
+import { useModal } from '../../ModalContext'
+import { useMessage } from '../../MessageContext'
+import { ResponsiveTable } from '@/components/ResponsiveTable'
+import { useAtomValue } from 'jotai'
+import { isMobileAtom } from '../../../store/index.js'
+import { useDefaultPageSize } from '../../hooks/useDefaultPageSize'
 
 const ApplyField = ({ name, label, fetchedValue, form }) => {
   const currentValue = Form.useWatch(name, form)
@@ -58,11 +74,31 @@ const ApplyField = ({ name, label, fetchedValue, form }) => {
 }
 
 export const Library = () => {
+  // 从后端配置获取默认分页大小
+  const defaultPageSize = useDefaultPageSize('library')
+
   const [loading, setLoading] = useState(true)
   const [list, setList] = useState([])
-  const [renderData, setRenderData] = useState([])
   const [keyword, setKeyword] = useState('')
   const navigate = useNavigate()
+  const isMobile = useAtomValue(isMobileAtom)
+  const [pagination, setPagination] = useState({
+    current: 1,
+    pageSize: defaultPageSize,
+    total: 0,
+  })
+
+  // 当默认分页大小加载完成后，更新 pagination
+  useEffect(() => {
+    if (defaultPageSize) {
+      setPagination(prev => ({
+        ...prev,
+        pageSize: defaultPageSize
+      }))
+    }
+  }, [defaultPageSize])
+  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
+  const [isRefreshModalOpen, setIsRefreshModalOpen] = useState(false)
 
   const [form] = Form.useForm()
   const [editOpen, setEditOpen] = useState(false)
@@ -78,27 +114,63 @@ export const Library = () => {
   const imageUrl = Form.useWatch('imageUrl', form)
   const [fetchedMetadata, setFetchedMetadata] = useState(null)
 
+  const modalApi = useModal()
+  const messageApi = useMessage()
+  const deleteFilesRef = useRef(true) // 删除时是否同时删除弹幕文件，默认为 true
+
+  // 源选择弹窗状态（用于标记和追更操作）
+  const [sourceSelectOpen, setSourceSelectOpen] = useState(false)
+  const [sourceSelectAction, setSourceSelectAction] = useState(null) // 'favorite' | 'incremental'
+  const [sourceSelectSources, setSourceSelectSources] = useState([])
+  const [sourceSelectTitle, setSourceSelectTitle] = useState('')
+  const [selectedSourceId, setSelectedSourceId] = useState(null)
+
   const getList = async () => {
     try {
       setLoading(true)
-      const res = await getAnimeLibrary()
-      setList(res.data?.animes || [])
-      setRenderData(res.data?.animes || [])
+      const res = await getAnimeLibrary({
+        keyword: keyword,
+        page: pagination.current,
+        pageSize: pagination.pageSize,
+      })
+      setList(res.data?.list || [])
+      setPagination(prev => ({
+        ...prev,
+        total: res.data?.total || 0,
+      }))
     } catch (error) {
       setList([])
-      setRenderData([])
     } finally {
       setLoading(false)
     }
   }
 
-  useEffect(() => {
-    getList()
-  }, [])
+  const handleCreateSuccess = () => {
+    setIsCreateModalOpen(false)
+    setPagination(n => {
+      return {
+        ...n,
+        current: 1,
+      }
+    })
+  }
 
   useEffect(() => {
-    setRenderData(list?.filter(it => it.title.includes(keyword)) || [])
-  }, [list, keyword])
+    setPagination(n => {
+      return {
+        ...n,
+        current: 1,
+      }
+    })
+  }, [keyword])
+
+  useEffect(() => {
+    getList()
+  }, [keyword, pagination.current, pagination.pageSize])
+
+  useEffect(() => {
+    setSearchInputValue(keyword)
+  }, [keyword])
 
   useEffect(() => {
     if (!fetchedMetadata) return
@@ -129,6 +201,12 @@ export const Library = () => {
 
     if (Object.keys(newValues).length > 0) {
       form.setFieldsValue(newValues)
+    }
+    // 没有封面时填充url
+    if (!imageUrl && !!fetchedMetadata?.imageUrl) {
+      form.setFieldsValue({
+        imageUrl: fetchedMetadata.imageUrl,
+      })
     }
   }, [fetchedMetadata, form])
 
@@ -173,13 +251,13 @@ export const Library = () => {
       title: '年份',
       dataIndex: 'year',
       key: 'year',
-      width: 80,
+      width: 70,
     },
     {
       title: '集数',
       dataIndex: 'episodeCount',
       key: 'episodeCount',
-      width: 50,
+      width: 70,
     },
     {
       title: '源数量',
@@ -191,7 +269,7 @@ export const Library = () => {
       title: '收录时间',
       dataIndex: 'createdAt',
       key: 'createdAt',
-      width: 200,
+      width: 150,
       render: (_, record) => {
         return (
           <div>{dayjs(record.createdAt).format('YYYY-MM-DD HH:mm:ss')}</div>
@@ -200,50 +278,156 @@ export const Library = () => {
     },
     {
       title: '操作',
-      width: 100,
+      width: 150,
       fixed: 'right',
       render: (_, record) => {
+        // 判断是否有已标记或已追更的源
+        const hasFavorited = record.sources?.some(s => s.isFavorited)
+        const hasIncremental = record.sources?.some(s => s.incrementalRefreshEnabled)
         return (
           <Space>
-            <span
-              className="cursor-pointer hover:text-primary"
-              onClick={async () => {
-                const res = await getAnimeDetail({
-                  animeId: record.animeId,
-                })
-                form.setFieldsValue({
-                  ...(res.data || {}),
-                  animeId: record.animeId,
-                })
-                setEditOpen(true)
-              }}
-            >
-              <MyIcon icon="edit" size={20}></MyIcon>
-            </span>
-            <span
-              className="cursor-pointer hover:text-primary"
-              onClick={() => {
-                navigate(`/anime/${record.animeId}`)
-              }}
-            >
-              <MyIcon icon="book" size={20}></MyIcon>
-            </span>
-            <span
-              className="cursor-pointer hover:text-primary"
-              onClick={() => {
-                handleDelete(record)
-              }}
-            >
-              <MyIcon icon="delete" size={20}></MyIcon>
-            </span>
+            <Tooltip title="编辑影视信息">
+              <span
+                className="cursor-pointer hover:text-primary"
+                onClick={async () => {
+                  const res = await getAnimeDetail({
+                    animeId: record.animeId,
+                  })
+                  form.setFieldsValue({
+                    ...(res.data || {}),
+                    animeId: record.animeId,
+                  })
+                  setEditOpen(true)
+                }}
+              >
+                <MyIcon icon="edit" size={20}></MyIcon>
+              </span>
+            </Tooltip>
+
+            <Tooltip title={hasFavorited ? "已标记（点击管理）" : "标记精确源"}>
+              <span
+                className={`cursor-pointer hover:text-primary ${hasFavorited ? 'text-yellow-500' : ''}`}
+                onClick={() => handleFavorite(record)}
+              >
+                <MyIcon icon={hasFavorited ? "favorites-fill" : "favorites"} size={20}></MyIcon>
+              </span>
+            </Tooltip>
+
+            <Tooltip title={hasIncremental ? "追更中（点击管理）" : "开启追更"}>
+              <span
+                className={`cursor-pointer hover:text-primary ${hasIncremental ? 'text-green-500' : ''}`}
+                onClick={() => handleIncremental(record)}
+              >
+                <MyIcon icon={hasIncremental ? "zengliang" : "clock"} size={20}></MyIcon>
+              </span>
+            </Tooltip>
+
+            <Tooltip title="详情">
+              <span
+                className="cursor-pointer hover:text-primary"
+                onClick={() => {
+                  if (!record.animeId || record.animeId === 0) {
+                    messageApi.error('无效的作品ID')
+                    return
+                  }
+                  navigate(`/anime/${record.animeId}`)
+                }}
+              >
+                <MyIcon icon="book" size={20}></MyIcon>
+              </span>
+            </Tooltip>
+            <Tooltip title="删除">
+              <span
+                className="cursor-pointer hover:text-primary"
+                onClick={() => {
+                  handleDelete(record)
+                }}
+              >
+                <MyIcon icon="delete" size={20}></MyIcon>
+              </span>
+            </Tooltip>
           </Space>
         )
       },
     },
   ]
 
+  // 处理标记操作
+  const handleFavorite = async (record) => {
+    const sources = record.sources || []
+    if (sources.length === 0) {
+      messageApi.warning('该作品没有数据源')
+      return
+    }
+    if (sources.length === 1) {
+      // 只有一个源，直接切换
+      try {
+        await toggleSourceFavorite({ sourceId: sources[0].sourceId })
+        messageApi.success('标记状态已更新')
+        getList()
+      } catch (error) {
+        messageApi.error('操作失败')
+      }
+    } else {
+      // 多个源，弹窗选择
+      setSourceSelectAction('favorite')
+      setSourceSelectSources(sources)
+      setSourceSelectTitle(record.title)
+      setSelectedSourceId(sources.find(s => s.isFavorited)?.sourceId || sources[0].sourceId)
+      setSourceSelectOpen(true)
+    }
+  }
+
+  // 处理追更操作
+  const handleIncremental = async (record) => {
+    const sources = record.sources || []
+    if (sources.length === 0) {
+      messageApi.warning('该作品没有数据源')
+      return
+    }
+    if (sources.length === 1) {
+      // 只有一个源，直接切换
+      try {
+        await toggleSourceIncremental({ sourceId: sources[0].sourceId })
+        messageApi.success('追更状态已更新')
+        getList()
+      } catch (error) {
+        messageApi.error('操作失败')
+      }
+    } else {
+      // 多个源，弹窗选择
+      setSourceSelectAction('incremental')
+      setSourceSelectSources(sources)
+      setSourceSelectTitle(record.title)
+      setSelectedSourceId(sources.find(s => s.incrementalRefreshEnabled)?.sourceId || sources[0].sourceId)
+      setSourceSelectOpen(true)
+    }
+  }
+
+  // 确认源选择
+  const handleSourceSelectConfirm = async () => {
+    if (!selectedSourceId) {
+      messageApi.warning('请选择一个数据源')
+      return
+    }
+    try {
+      if (sourceSelectAction === 'favorite') {
+        await toggleSourceFavorite({ sourceId: selectedSourceId })
+        messageApi.success('标记状态已更新')
+      } else if (sourceSelectAction === 'incremental') {
+        await toggleSourceIncremental({ sourceId: selectedSourceId })
+        messageApi.success('追更状态已更新')
+      }
+      setSourceSelectOpen(false)
+      getList()
+    } catch (error) {
+      messageApi.error('操作失败')
+    }
+  }
+
   const handleDelete = async record => {
-    Modal.confirm({
+    deleteFilesRef.current = true // 重置为默认值
+    modalApi.confirm({
       title: '删除',
       zIndex: 1002,
       content: (
@@ -251,23 +435,32 @@ export const Library = () => {
           确定要删除{record.name}吗？
           <br />
           此操作将在后台提交一个删除任务
+          <div className="flex items-center gap-2 mt-3">
+            <span>同时删除弹幕文件：</span>
+            <Switch
+              defaultChecked={true}
+              onChange={checked => {
+                deleteFilesRef.current = checked
+              }}
+            />
+          </div>
         </div>
       ),
       okText: '确认',
       cancelText: '取消',
       onOk: async () => {
         try {
-          const res = await deleteAnime({ animeId: record.animeId })
+          const res = await deleteAnime({ animeId: record.animeId, deleteFiles: deleteFilesRef.current })
           goTask(res)
         } catch (error) {
-          message.error('提交删除任务失败')
+          messageApi.error('提交删除任务失败')
         }
       },
     })
   }
 
   const goTask = res => {
-    Modal.confirm({
+    modalApi.confirm({
       title: '提示',
       zIndex: 1002,
       content: (
@@ -300,9 +493,9 @@ export const Library = () => {
         tvdbId: values.tvdbId ? `${values.tvdbId}` : null,
       })
       getList()
-      message.success('信息更新成功')
+      messageApi.success('信息更新成功')
     } catch (error) {
-      message.error(error.detail || '编辑失败')
+      messageApi.error(error.detail || '编辑失败')
     } finally {
       setConfirmLoading(false)
       setEditOpen(false)
@@ -321,18 +514,20 @@ export const Library = () => {
 
   const handleSearchAsId = async ({ source, currentId, mediaType }) => {
     try {
-      if (searchAsIdLoading) return
+      if (searchAsIdLoading || !currentId) return
       setSearchAsIdLoading(true)
       const res = await getAnimeInfoAsSource({ source, currentId, mediaType })
       applySearchSelectionData({
         data: res.data,
         source,
       })
-      message.success(
+      messageApi.success(
         `${source.toUpperCase()} 信息获取成功，请检查并应用建议的别名。`
       )
     } catch (error) {
-      message.error(`获取 ${source.toUpperCase()} 详情失败: ${error.message}`)
+      messageApi.error(
+        `获取 ${source.toUpperCase()} 详情失败: ${error.message}`
+      )
     } finally {
       setSearchAsIdLoading(false)
     }
@@ -416,10 +611,10 @@ export const Library = () => {
         setTmdbResult(res?.data || [])
         setTmdbOpen(true)
       } else {
-        message.error('没有找到相关内容')
+        messageApi.error('没有找到相关内容')
       }
     } catch (error) {
-      message.error(`TMDB搜索失败:${error.message}`)
+      messageApi.error(`TMDB搜索失败:${error.message}`)
     } finally {
       setSearchTmdbLoading(false)
     }
@@ -440,10 +635,10 @@ export const Library = () => {
         setTvdbResult(res?.data || [])
         setTvdbOpen(true)
       } else {
-        message.error('没有找到相关内容')
+        messageApi.error('没有找到相关内容')
       }
     } catch (error) {
-      message.error(`TVDB搜索失败:${error.message}`)
+      messageApi.error(`TVDB搜索失败:${error.message}`)
     } finally {
       setSearchTvdbLoading(false)
     }
@@ -463,10 +658,10 @@ export const Library = () => {
         setDoubanResult(res?.data || [])
         setDoubanOpen(true)
       } else {
-        message.error('没有找到相关内容')
+        messageApi.error('没有找到相关内容')
       }
     } catch (error) {
-      message.error(`豆瓣搜索失败:${error.message}`)
+      messageApi.error(`豆瓣搜索失败:${error.message}`)
     } finally {
       setSearchDoubanLoading(false)
     }
@@ -487,10 +682,10 @@ export const Library = () => {
         setImdbResult(res?.data || [])
         setImdbOpen(true)
       } else {
-        message.error('没有找到相关内容')
+        messageApi.error('没有找到相关内容')
       }
     } catch (error) {
-      message.error(
+      messageApi.error(
         error.detail || `IMDB搜索失败: ${error.message || '未知错误'}`
       )
     } finally {
@@ -517,10 +712,10 @@ export const Library = () => {
         setEgidResult(res?.data || [])
         setEgidOpen(true)
       } else {
-        message.error('没有找到相关内容')
+        messageApi.error('没有找到相关内容')
       }
     } catch (error) {
-      message.error(`剧集组搜索失败:${error.message}`)
+      messageApi.error(`剧集组搜索失败:${error.message}`)
     } finally {
       setSearchEgidLoading(false)
     }
@@ -538,13 +733,24 @@ export const Library = () => {
         setAllEpisode(res?.data || {})
         setEpisodeOpen(true)
       } else {
-        message.error('没有找到相关分集')
+        messageApi.error('没有找到相关分集')
       }
     } catch (error) {
-      message.error('没有找到相关分集')
+      messageApi.error('没有找到相关分集')
     } finally {
       setSearchAllEpisodeLoading(false)
     }
+  }
+
+  const [searchInputValue, setSearchInputValue] = useState('')
+
+  const handleSearch = () => {
+    setKeyword(searchInputValue)
+  }
+
+  const handleReset = () => {
+    setKeyword('')
+    setSearchInputValue('')
   }
 
   const [bgmResult, setBgmResult] = useState([])
@@ -561,10 +767,10 @@ export const Library = () => {
         setBgmResult(res?.data || [])
         setBgmOpen(true)
       } else {
-        message.error('没有找到相关内容')
+        messageApi.error('没有找到相关内容')
       }
     } catch (error) {
-      message.error(`BGM搜索失败:${error.message}`)
+      messageApi.error(`BGM搜索失败:${error.message}`)
     } finally {
       setSearchBgmLoading(false)
     }
@@ -576,36 +782,221 @@ export const Library = () => {
         loading={loading}
         title="弹幕库"
         extra={
-          <>
-            <Input
-              placeholder="搜索已收录的影视"
-              onChange={e => setKeyword(e.target.value)}
-            />
-          </>
+          !isMobile && (
+            <Space>
+              <Input.Search
+                placeholder="请输入影视名称"
+                value={searchInputValue}
+                onChange={(e) => setSearchInputValue(e.target.value)}
+                onSearch={handleSearch}
+                enterButton="搜索"
+                allowClear
+                style={{ width: 300 }}
+              />
+              {keyword && (
+                <Button onClick={handleReset}>
+                  重置
+                </Button>
+              )}
+              <Button onClick={() => setIsRefreshModalOpen(true)}>
+                批量管理
+              </Button>
+              <Button type="primary" onClick={() => setIsCreateModalOpen(true)}>
+                自定义影视条目
+              </Button>
+            </Space>
+          )
         }
       >
-        {!!renderData?.length ? (
-          <Table
-            pagination={
-              renderData?.length > 50
-                ? {
-                    pageSize: 50,
-                    showTotal: total => `共 ${total} 条数据`,
-                    showSizeChanger: true,
-                    showQuickJumper: true,
-                  }
-                : null
-            }
-            size="small"
-            dataSource={renderData}
-            columns={columns}
-            rowKey={'animeId'}
-            scroll={{ x: '100%' }}
-          />
-        ) : (
-          <Empty />
+        {isMobile && (
+          <div className="mb-4">
+            <div className="flex gap-2 mb-3 items-center">
+              <div className="flex-1 flex items-center">
+                <Input
+                  placeholder="请输入影视名称"
+                  value={searchInputValue}
+                  onChange={(e) => setSearchInputValue(e.target.value)}
+                  onPressEnter={handleSearch}
+                  allowClear
+                  style={{
+                    height: 44,
+                    lineHeight: '44px',
+                    paddingTop: 0,
+                    paddingBottom: 0,
+                    borderTopRightRadius: 0,
+                    borderBottomRightRadius: 0,
+                    fontSize: 14
+                  }}
+                  className="flex-1"
+                />
+                <Button
+                  type="primary"
+                  onClick={handleSearch}
+                  style={{
+                    height: 44,
+                    lineHeight: '44px',
+                    borderTopLeftRadius: 0,
+                    borderTopRightRadius: 9,
+                    borderBottomLeftRadius: 0,
+                    borderBottomRightRadius: 9,
+                    fontSize: 14
+                  }}
+                >
+                  搜索
+                </Button>
+              </div>
+              {keyword && (
+                <Button onClick={handleReset} style={{ height: 44 }}>
+                  重置
+                </Button>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <Button
+                block
+                size="large"
+                onClick={() => setIsRefreshModalOpen(true)}
+              >
+                批量管理
+              </Button>
+              <Button
+                type="primary"
+                block
+                size="large"
+                onClick={() => setIsCreateModalOpen(true)}
+              >
+                自定义影视条目
+              </Button>
+            </div>
+          </div>
         )}
+        <ResponsiveTable
+          dataSource={list}
+          columns={columns}
+          loading={loading}
+          rowKey="animeId"
+          pagination={{
+            ...pagination,
+            showTotal: total => `共 ${total} 条数据`,
+            onChange: (page, pageSize) => {
+              setPagination(n => ({
+                ...n,
+                current: page,
+                pageSize,
+              }))
+            },
+            onShowSizeChange: (_, size) => {
+              setPagination(n => ({
+                ...n,
+                pageSize: size,
+              }))
+            },
+            hideOnSinglePage: true,
+          }}
+          renderCard={(record) => (
+            <div className="space-y-3">
+              <div className="flex gap-3">
+                {(() => {
+                  let imageSrc = record.localImagePath || record.imageUrl
+                  if (imageSrc && imageSrc.startsWith('/images/')) {
+                    imageSrc = imageSrc.replace('/images/', '/data/images/')
+                  }
+                  return imageSrc ? (
+                    <img src={imageSrc} className="w-20 h-28 object-cover rounded" alt={record.title} />
+                  ) : (
+                    <div className="w-20 h-28 bg-gray-200 dark:bg-gray-700 rounded flex items-center justify-center">
+                      <MyIcon icon="image" size={32} />
+                    </div>
+                  )
+                })()}
+                <div className="flex-1 space-y-2">
+                  <div className="font-bold text-lg line-clamp-2">{record.title}</div>
+                  <div className="flex flex-wrap gap-2">
+                    <Tag color="blue">{DANDAN_TYPE_DESC_MAPPING[record.type]}</Tag>
+                    {record.season && <Tag>第{record.season}季</Tag>}
+                    {record.year && <Tag>{record.year}年</Tag>}
+                  </div>
+                  <div className="text-sm text-gray-600 dark:text-gray-400">
+                    <span>集数: {record.episodeCount || 0}</span>
+                    <span className="mx-2">·</span>
+                    <span>源: {record.sourceCount || 0}</span>
+                  </div>
+                  <div className="text-xs text-gray-500 dark:text-gray-500">
+                    {dayjs(record.createdAt).format('YYYY-MM-DD HH:mm')}
+                  </div>
+                </div>
+              </div>
+              <div className="flex justify-center gap-2 pt-2 border-t border-gray-200 dark:border-gray-700 flex-wrap">
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<MyIcon icon="edit" size={16} />}
+                  onClick={async () => {
+                    const res = await getAnimeDetail({ animeId: record.animeId })
+                    form.setFieldsValue({
+                      ...(res.data || {}),
+                      animeId: record.animeId,
+                    })
+                    setEditOpen(true)
+                  }}
+                >
+                  编辑
+                </Button>
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<MyIcon icon={record.sources?.some(s => s.isFavorited) ? "favorites-fill" : "favorites"} size={16} />}
+                  className={record.sources?.some(s => s.isFavorited) ? 'text-yellow-500' : ''}
+                  onClick={() => handleFavorite(record)}
+                >
+                  标记
+                </Button>
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<MyIcon icon={record.sources?.some(s => s.incrementalRefreshEnabled) ? "zengliang" : "clock"} size={16} />}
+                  className={record.sources?.some(s => s.incrementalRefreshEnabled) ? 'text-green-500' : ''}
+                  onClick={() => handleIncremental(record)}
+                >
+                  追更
+                </Button>
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<MyIcon icon="book" size={16} />}
+                  onClick={() => {
+                    if (!record.animeId || record.animeId === 0) {
+                      messageApi.error('无效的作品ID')
+                      return
+                    }
+                    navigate(`/anime/${record.animeId}`)
+                  }}
+                >
+                  详情
+                </Button>
+                <Button
+                  size="small"
+                  type="text"
+                  danger
+                  icon={<MyIcon icon="delete" size={16} />}
+                  onClick={() => handleDelete(record)}
+                >
+                  删除
+                </Button>
+              </div>
+            </div>
+          )}
+        />
       </Card>
+      <CreateAnimeModal
+        open={isCreateModalOpen}
+        onCancel={() => setIsCreateModalOpen(false)}
+        onSuccess={handleCreateSuccess}
+      />
+      <IncrementalRefreshModal
+        open={isRefreshModalOpen}
+        onCancel={() => setIsRefreshModalOpen(false)}
+      />
       <Modal
         title="编辑影视信息"
         open={editOpen}
@@ -671,9 +1062,9 @@ export const Library = () => {
                         animeId,
                         imageUrl: imageUrl,
                       })
-                      message.success('海报已刷新并缓存成功！')
+                      messageApi.success('海报已刷新并缓存成功！')
                     } catch (error) {
-                      message.error(`刷新海报失败: ${error.message}`)
+                      messageApi.error(`刷新海报失败: ${error.message}`)
                     }
                   }}
                 >
@@ -682,25 +1073,45 @@ export const Library = () => {
               }
             />
           </Form.Item>
+          {!!fetchedMetadata?.imageUrl &&
+            fetchedMetadata?.imageUrl !== imageUrl && (
+              <Form.Item className="text-right">
+                <Button
+                  className="cursor-pointer"
+                  onClick={() => {
+                    form.setFieldsValue({
+                      imageUrl: fetchedMetadata.imageUrl,
+                    })
+                  }}
+                >
+                  应用URL
+                </Button>
+              </Form.Item>
+            )}
+
           <Form.Item name="tmdbId" label="TMDB ID">
             <Input.Search
               placeholder="例如：1396"
               allowClear
-              enterButton="Search"
+              enterButton="搜索"
               suffix={
-                <span
-                  className="cursor-pointer opacity-80 transition-all hover:opacity-100"
-                  onClick={() => {
-                    handleSearchAsId({
-                      source: 'tmdb',
-                      currentId: tmdbId,
-                      mediaType:
-                        type === DANDAN_TYPE_MAPPING.tvseries ? 'tv' : 'movie',
-                    })
-                  }}
-                >
-                  <MyIcon icon="jingzhun" size={20} />
-                </span>
+                <Tooltip title="ID直搜">
+                  <span
+                    className="cursor-pointer opacity-80 transition-all hover:opacity-100"
+                    onClick={() => {
+                      handleSearchAsId({
+                        source: 'tmdb',
+                        currentId: tmdbId,
+                        mediaType:
+                          type === DANDAN_TYPE_MAPPING.tvseries
+                            ? 'tv'
+                            : 'movie',
+                      })
+                    }}
+                  >
+                    <MyIcon icon="jingzhun" size={20} />
+                  </span>
+                </Tooltip>
               }
               loading={searchTmdbLoading}
               onSearch={() => {
@@ -712,7 +1123,7 @@ export const Library = () => {
             <Input.Search
               placeholder="TMDB Episode Group Id"
               allowClear
-              enterButton="Search"
+              enterButton="搜索"
               loading={searchEgidLoading}
               onSearch={() => {
                 onEgidSearch()
@@ -724,19 +1135,21 @@ export const Library = () => {
             <Input.Search
               placeholder="例如：296100"
               allowClear
-              enterButton="Search"
+              enterButton="搜索"
               suffix={
-                <span
-                  className="cursor-pointer opacity-80 transition-all hover:opacity-100"
-                  onClick={() => {
-                    handleSearchAsId({
-                      source: 'bangumi',
-                      currentId: bangumiId,
-                    })
-                  }}
-                >
-                  <MyIcon icon="jingzhun" size={20} />
-                </span>
+                <Tooltip title="ID直搜">
+                  <span
+                    className="cursor-pointer opacity-80 transition-all hover:opacity-100"
+                    onClick={() => {
+                      handleSearchAsId({
+                        source: 'bangumi',
+                        currentId: bangumiId,
+                      })
+                    }}
+                  >
+                    <MyIcon icon="jingzhun" size={20} />
+                  </span>
+                </Tooltip>
               }
               loading={searchBgmLoading}
               onSearch={() => {
@@ -748,23 +1161,25 @@ export const Library = () => {
             <Input.Search
               placeholder="例如：364093"
               allowClear
-              enterButton="Search"
+              enterButton="搜索"
               suffix={
-                <span
-                  className="cursor-pointer opacity-80 transition-all hover:opacity-100"
-                  onClick={() => {
-                    handleSearchAsId({
-                      source: 'tvdb',
-                      mediaType:
-                        type === DANDAN_TYPE_MAPPING.tvseries
-                          ? 'series'
-                          : 'movie',
-                      currentId: tvdbId,
-                    })
-                  }}
-                >
-                  <MyIcon icon="jingzhun" size={20} />
-                </span>
+                <Tooltip title="ID直搜">
+                  <span
+                    className="cursor-pointer opacity-80 transition-all hover:opacity-100"
+                    onClick={() => {
+                      handleSearchAsId({
+                        source: 'tvdb',
+                        mediaType:
+                          type === DANDAN_TYPE_MAPPING.tvseries
+                            ? 'series'
+                            : 'movie',
+                        currentId: tvdbId,
+                      })
+                    }}
+                  >
+                    <MyIcon icon="jingzhun" size={20} />
+                  </span>
+                </Tooltip>
               }
               loading={searchTvdbLoading}
               onSearch={() => {
@@ -776,23 +1191,25 @@ export const Library = () => {
             <Input.Search
               placeholder="例如：35297708"
               allowClear
-              enterButton="Search"
+              enterButton="搜索"
               suffix={
-                <span
-                  className="cursor-pointer opacity-80 transition-all hover:opacity-100"
-                  onClick={() => {
-                    handleSearchAsId({
-                      source: 'douban',
-                      mediaType:
-                        type === DANDAN_TYPE_MAPPING.tvseries
-                          ? 'series'
-                          : 'movie',
-                      currentId: doubanId,
-                    })
-                  }}
-                >
-                  <MyIcon icon="jingzhun" size={20} />
-                </span>
+                <Tooltip title="ID直搜">
+                  <span
+                    className="cursor-pointer opacity-80 transition-all hover:opacity-100"
+                    onClick={() => {
+                      handleSearchAsId({
+                        source: 'douban',
+                        mediaType:
+                          type === DANDAN_TYPE_MAPPING.tvseries
+                            ? 'series'
+                            : 'movie',
+                        currentId: doubanId,
+                      })
+                    }}
+                  >
+                    <MyIcon icon="jingzhun" size={20} />
+                  </span>
+                </Tooltip>
               }
               loading={searchDoubanLoading}
               onSearch={() => {
@@ -804,23 +1221,25 @@ export const Library = () => {
             <Input.Search
               placeholder="例如：tt9140554"
               allowClear
-              enterButton="Search"
+              enterButton="搜索"
               suffix={
-                <span
-                  className="cursor-pointer opacity-80 transition-all hover:opacity-100"
-                  onClick={() => {
-                    handleSearchAsId({
-                      source: 'imdb',
-                      mediaType:
-                        type === DANDAN_TYPE_MAPPING.tvseries
-                          ? 'series'
-                          : 'movie',
-                      currentId: imdbId,
-                    })
-                  }}
-                >
-                  <MyIcon icon="jingzhun" size={20} />
-                </span>
+                <Tooltip title="ID直搜">
+                  <span
+                    className="cursor-pointer opacity-80 transition-all hover:opacity-100"
+                    onClick={() => {
+                      handleSearchAsId({
+                        source: 'imdb',
+                        mediaType:
+                          type === DANDAN_TYPE_MAPPING.tvseries
+                            ? 'series'
+                            : 'movie',
+                        currentId: imdbId,
+                      })
+                    }}
+                  >
+                    <MyIcon icon="jingzhun" size={20} />
+                  </span>
+                </Tooltip>
               }
               loading={searchImdbLoading}
               onSearch={() => {
@@ -868,6 +1287,20 @@ export const Library = () => {
             fetchedValue={fetchedMetadata?.aliasesCn?.[2]}
             form={form}
           />
+          <Form.Item
+            name="aliasLocked"
+            label={
+              <Space>
+                <span>锁定别名</span>
+                <Tooltip title="锁定后,TMDB自动刮削任务将不会自动更新此作品的别名信息">
+                  <QuestionCircleOutlined />
+                </Tooltip>
+              </Space>
+            }
+            valuePropName="checked"
+          >
+            <Switch />
+          </Form.Item>
           <Form.Item name="animeId" hidden>
             <Input />
           </Form.Item>
@@ -886,6 +1319,8 @@ export const Library = () => {
           dataSource={tmdbResult}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -915,6 +1350,7 @@ export const Library = () => {
                           currentId: item.id,
                         })
                         form.setFieldsValue({ tmdbId: res.data.id })
+
                         setFetchedMetadata(res.data)
                         setTmdbOpen(false)
                       }}
@@ -941,6 +1377,8 @@ export const Library = () => {
           dataSource={imdbResult}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -969,6 +1407,7 @@ export const Library = () => {
                           currentId: item.id,
                         })
                         form.setFieldsValue({ imdbId: res.data.id })
+
                         setFetchedMetadata(res.data)
                         setImdbOpen(false)
                       }}
@@ -995,6 +1434,8 @@ export const Library = () => {
           dataSource={tvdbResult}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -1049,6 +1490,8 @@ export const Library = () => {
           dataSource={egidResult}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -1101,6 +1544,8 @@ export const Library = () => {
           dataSource={allEpisode?.groups || []}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -1109,11 +1554,16 @@ export const Library = () => {
                   {item.name} (Order: {item.order})
                 </div>
                 {item.episodes?.map((ep, i) => {
+                  // 计算绝对集数显示格式
+                  // 特别季(season_number=0): S00EXX
+                  // 正片(season_number=1): S01EXX (使用episode_number作为绝对序号)
+                  const seasonNum = ep.season_number || ep.seasonNumber || 0
+                  const episodeNum = ep.episode_number || ep.episodeNumber || (ep.order + 1)
+                  const absoluteDisplay = `S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`
+
                   return (
                     <div key={i}>
-                      第{ep.order + 1}集（绝对：S
-                      {padStart(ep.seasonNumber, 2, '0')}E
-                      {padStart(ep.episodeNumber, 2, '0')}）|
+                      第{ep.order + 1}集（绝对：{absoluteDisplay}）|
                       {ep.name || '无标题'}
                     </div>
                   )
@@ -1136,6 +1586,8 @@ export const Library = () => {
           dataSource={bgmResult}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -1190,6 +1642,8 @@ export const Library = () => {
           dataSource={doubanResult}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -1230,6 +1684,46 @@ export const Library = () => {
             )
           }}
         />
+      </Modal>
+      {/* 源选择弹窗 */}
+      <Modal
+        title={`${sourceSelectAction === 'favorite' ? '选择要标记的源' : '选择要追更的源'} - ${sourceSelectTitle}`}
+        open={sourceSelectOpen}
+        onOk={handleSourceSelectConfirm}
+        onCancel={() => setSourceSelectOpen(false)}
+        okText="确认"
+        cancelText="取消"
+        zIndex={110}
+      >
+        <div className="py-4">
+          <Radio.Group
+            value={selectedSourceId}
+            onChange={(e) => setSelectedSourceId(e.target.value)}
+            className="w-full"
+          >
+            <Space direction="vertical" className="w-full">
+              {sourceSelectSources.map((source) => (
+                <Radio key={source.sourceId} value={source.sourceId} className="w-full">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium">{source.providerName}</span>
+                    {source.isFavorited && (
+                      <Tag color="gold" className="ml-2">已标记</Tag>
+                    )}
+                    {source.incrementalRefreshEnabled && (
+                      <Tag color="green" className="ml-2">追更中</Tag>
+                    )}
+                  </div>
+                </Radio>
+              ))}
+            </Space>
+          </Radio.Group>
+          <div className="mt-4 text-gray-500 text-sm">
+            {sourceSelectAction === 'favorite'
+              ? '提示：每个作品只能有一个标记的源，选择后其他源的标记会被取消。'
+              : '提示：每个作品只能有一个追更的源，选择后其他源的追更会被取消。'
+            }
+          </div>
+        </div>
       </Modal>
     </div>
   )

@@ -20,6 +20,8 @@ import {
 } from '../../../apis'
 import dayjs from 'dayjs'
 import { MyIcon } from '@/components/MyIcon.jsx'
+import { useModal } from '../../../ModalContext'
+import { useMessage } from '../../../MessageContext'
 
 export const Ua = () => {
   const [loading, setLoading] = useState(false)
@@ -29,6 +31,8 @@ export const Ua = () => {
   const [uaRules, setUaRules] = useState([])
   const [uakeyword, setUakeyword] = useState('')
   const [addLoading, setAddLoading] = useState(false)
+  const modalApi = useModal()
+  const messageApi = useMessage()
 
   const columns = [
     {
@@ -81,14 +85,14 @@ export const Ua = () => {
   const handleEdit = async () => {
     try {
       await setUaMode({ value: mode })
-      message.success('保存成功')
+      messageApi.success('保存成功')
     } catch (error) {
-      message.error('保存失败')
+      messageApi.error('保存失败')
     }
   }
 
   const handleDelete = async record => {
-    Modal.confirm({
+    modalApi.confirm({
       title: '删除',
       zIndex: 1002,
       content: <div>您确定要删除{record.uaString}吗？</div>,
@@ -100,10 +104,10 @@ export const Ua = () => {
             id: record.id,
           })
           handleList()
-          message.success('删除成功')
+          messageApi.success('删除成功')
         } catch (error) {
           console.error(error)
-          message.error('删除失败')
+          messageApi.error('删除失败')
         }
       },
     })
@@ -113,7 +117,7 @@ export const Ua = () => {
     try {
       if (addLoading) return
       if (!uakeyword) {
-        message.error('请输入UA关键词')
+        messageApi.error('请输入UA关键词')
         return
       }
       setAddLoading(true)
@@ -121,7 +125,7 @@ export const Ua = () => {
         uaString: uakeyword,
       })
     } catch (error) {
-      message.error('添加失败')
+      messageApi.error('添加失败')
     } finally {
       setUakeyword('')
       handleList()
@@ -135,13 +139,13 @@ export const Ua = () => {
       setUaRules(res.data)
       setOpen(true)
     } catch (error) {
-      message.error('获取失败')
+      messageApi.error('获取失败')
     }
   }
 
   return (
     <div className="my-6">
-      <Card loading={loading} title="全局 User-Agent 过滤">
+      <Card title="全局 User-Agent 过滤">
         <div className="mb-4">
           对所有通过Token的访问请求进行UA过滤。模式为 "off" 时不过滤。
         </div>
@@ -155,20 +159,21 @@ export const Ua = () => {
                 setMode(value)
               }}
               style={{ width: '100%' }}
-              value={mode}
+              value={['off', 'blacklist', 'whitelist'].includes(mode) ? mode : 'off'}
+              loading={loading}
               options={[
-                { value: 'permanent', label: '关闭 (Off)' },
+                { value: 'off', label: '关闭 (Off)' },
                 { value: 'blacklist', label: '黑名单 (Blacklist)' },
                 { value: 'whitelist', label: '白名单 (Whitelist)' },
               ]}
             />
           </Col>
-          <Col md={6} xs={12}>
-            <Button type="primary" block onClick={handleEdit}>
+          <Col md={6} xs={12} className="mt-3 md:mt-0">
+            <Button type="primary" block onClick={handleEdit} loading={loading}>
               保存模式
             </Button>
           </Col>
-          <Col md={6} xs={12}>
+          <Col md={6} xs={12} className="mt-3 md:mt-0">
             <Button type="primary" block onClick={handleList}>
               名单管理
             </Button>

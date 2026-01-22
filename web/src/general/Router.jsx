@@ -1,6 +1,6 @@
 import { createBrowserRouter } from 'react-router-dom'
-
 import { RoutePaths } from './RoutePaths.jsx'
+import { RouterScrollBehavior } from './RouterScrollBehavior.jsx'
 import { NotFound } from './NotFound.jsx'
 import { Layout } from './Layout.jsx'
 import { LayoutLogin } from './LayoutLogin.jsx'
@@ -16,11 +16,16 @@ import { EpisodeDetail } from '../pages/episode/[id].jsx'
 import { CommentDetail } from '../pages/comment/[id].jsx'
 import { Control } from '../pages/control/index.jsx'
 import { Bullet } from '../pages/bullet/index.jsx'
+import MediaFetch from '../pages/media-fetch/index.jsx'
 
 export const router = createBrowserRouter([
   {
     path: '/',
-    element: <Layout />,
+    element: (
+      <RouterScrollBehavior>
+        <Layout />
+      </RouterScrollBehavior>
+    ),
     children: [
       {
         index: true,
@@ -33,6 +38,10 @@ export const router = createBrowserRouter([
       {
         path: RoutePaths.BULLET,
         element: <Bullet />,
+      },
+      {
+        path: RoutePaths.MEDIA_FETCH,
+        element: <MediaFetch />,
       },
       {
         path: RoutePaths.LIBRARY,

@@ -3,12 +3,16 @@ import logging
 import logging.handlers
 from pathlib import Path
 import re
-from typing import List
+from typing import List, Set
+import asyncio
 
 from .config import settings
 
 # 这个双端队列将用于在内存中存储最新的日志，以供Web界面展示
 _logs_deque = collections.deque(maxlen=200)
+
+# 用于存储所有订阅日志的队列
+_log_subscribers: Set[asyncio.Queue] = set()
 
 # 自定义一个日志处理器，它会将日志记录发送到我们的双端队列中
 class DequeHandler(logging.Handler):
@@ -18,13 +22,50 @@ class DequeHandler(logging.Handler):
 
     def emit(self, record):
         # 我们只存储格式化后的消息字符串
-        self.deque.appendleft(self.format(record))
+        log_message = self.format(record)
+        self.deque.appendleft(log_message)
+
+        # 通知所有订阅者
+        for queue in _log_subscribers:
+            try:
+                queue.put_nowait(log_message)
+            except asyncio.QueueFull:
+                # 如果队列满了,跳过这条日志
+                pass
 
 # 新增：一个过滤器，用于从UI日志中排除 httpx 的日志
 class NoHttpxLogFilter(logging.Filter):
     def filter(self, record):
         # 不记录来自 'httpx' logger 的日志
         return not record.name.startswith('httpx')
+
+# 新增：一个过滤器，用于隐藏日志中的敏感信息（API密钥、Token等）
+class SensitiveInfoFilter(logging.Filter):
+    """过滤器，用于隐藏日志中的敏感信息"""
+
+    # 敏感信息的正则表达式模式
+    PATTERNS = [
+        (re.compile(r'(api_key=)([a-zA-Z0-9]{20,})'), r'\1****'),  # TMDB API key
+        (re.compile(r'(apikey=)([a-zA-Z0-9]{20,})'), r'\1****'),  # 其他API key
+        (re.compile(r'(token=)([a-zA-Z0-9_-]{20,})'), r'\1****'),  # Token
+        (re.compile(r'(Authorization:\s*Bearer\s+)([a-zA-Z0-9_-]{20,})'), r'\1****'),  # Bearer token
+        (re.compile(r'(Cookie:\s*[^;]*?)((?:SESSDATA|bili_jct|DedeUserID|buvid3|_m_h5_tk)=[^;]+)'), r'\1****'),  # Cookie中的敏感字段
+        (re.compile(r'(_m_h5_tk=)([a-zA-Z0-9_-]+)'), r'\1****'),  # Youku token
+    ]
+
+    def filter(self, record):
+        # 获取日志消息
+        msg = record.getMessage()
+
+        # 应用所有替换模式
+        for pattern, replacement in self.PATTERNS:
+            msg = pattern.sub(replacement, msg)
+
+        # 更新日志消息
+        record.msg = msg
+        record.args = ()  # 清空args，因为我们已经格式化了消息
+
+        return True
 
 # 新增：一个过滤器，用于从UI日志中排除B站特定的信息性日志
 class BilibiliInfoFilter(logging.Filter):
@@ -69,8 +110,34 @@ def setup_logging():
     以及一个用于API的内存双端队列。
     此函数应在应用启动时被调用一次。
     """
-    log_dir = Path(__file__).parent.parent / "config" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    def _is_docker_environment():
+        """检测是否在Docker容器中运行"""
+        import os
+        # 方法1: 检查 /.dockerenv 文件（Docker标准做法）
+        if Path("/.dockerenv").exists():
+            return True
+        # 方法2: 检查环境变量
+        if os.getenv("DOCKER_CONTAINER") == "true" or os.getenv("IN_DOCKER") == "true":
+            return True
+        # 方法3: 检查当前工作目录是否为 /app
+        if Path.cwd() == Path("/app"):
+            return True
+        return False
+
+    if _is_docker_environment():
+        log_dir = Path("/app/config/logs")
+    else:
+        log_dir = Path("config/logs")
+
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError) as e:
+        # 如果无法创建日志目录，使用当前目录
+        print(f"警告: 无法创建日志目录 {log_dir}: {e}，将使用当前目录")
+        log_dir = Path(".")
+        log_file = log_dir / "app.log"
+    else:
+        log_file = log_dir / "app.log"
     log_file = log_dir / "app.log"
 
     # 为控制台和文件日志定义详细的格式
@@ -92,9 +159,14 @@ def setup_logging():
 
     # 添加新的过滤器到根日志记录器，以便翻译所有输出
     logger.addFilter(ApschedulerLogTranslatorFilter())
+    logger.addFilter(SensitiveInfoFilter())  # 添加敏感信息过滤器到所有处理器
 
     logger.addHandler(logging.StreamHandler()) # 控制台处理器
     logger.addHandler(logging.handlers.RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')) # 文件处理器
+
+    # 配置httpx logger,确保其日志也经过敏感信息过滤
+    httpx_logger = logging.getLogger("httpx")
+    httpx_logger.addFilter(SensitiveInfoFilter())
 
     # 创建并配置 DequeHandler，以过滤掉不希望在UI上显示的内容
     deque_handler = DequeHandler(_logs_deque)
@@ -139,6 +211,87 @@ def setup_logging():
     scraper_logger.addHandler(scraper_handler)
     logging.info("专用的搜索源响应日志已初始化，将输出到 %s", scraper_log_file)
 
+    # --- 新增：为元数据响应设置一个专用的日志记录器 ---
+    metadata_log_file = log_dir / "metadata_responses.log"
+
+    if metadata_log_file.exists():
+        try:
+            with open(metadata_log_file, 'w', encoding='utf-8') as f:
+                f.truncate(0)
+            logging.info(f"已清空旧的元数据响应日志: {metadata_log_file}")
+        except IOError as e:
+            logging.error(f"清空元数据响应日志失败: {e}")
+
+    metadata_logger = logging.getLogger("metadata_responses")
+    metadata_logger.setLevel(logging.DEBUG)
+    metadata_logger.propagate = False
+
+    metadata_handler = logging.handlers.RotatingFileHandler(
+        metadata_log_file, maxBytes=10*1024*1024, backupCount=3, encoding='utf-8'
+    )
+    metadata_handler.setFormatter(logging.Formatter(
+        '[%(asctime)s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    metadata_logger.addHandler(metadata_handler)
+    logging.info("专用的元数据响应日志已初始化，将输出到 %s", metadata_log_file)
+
+    # --- 新增：为AI原始响应设置一个专用的日志记录器 ---
+    ai_log_file = log_dir / "ai_responses.log"
+
+    if ai_log_file.exists():
+        try:
+            with open(ai_log_file, 'w', encoding='utf-8') as f:
+                f.truncate(0)
+            logging.info(f"已清空旧的AI响应日志: {ai_log_file}")
+        except IOError as e:
+            logging.error(f"清空AI响应日志失败: {e}")
+
+    ai_logger = logging.getLogger("ai_responses")
+    ai_logger.setLevel(logging.DEBUG)
+    ai_logger.propagate = False
+
+    ai_handler = logging.handlers.RotatingFileHandler(
+        ai_log_file, maxBytes=10*1024*1024, backupCount=3, encoding='utf-8'
+    )
+    ai_handler.setFormatter(logging.Formatter(
+        '[%(asctime)s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    ai_logger.addHandler(ai_handler)
+    logging.info("专用的AI响应日志已初始化，将输出到 %s", ai_log_file)
+
+    # --- 新增：为 Webhook 原始请求设置一个专用的日志记录器 ---
+    webhook_log_file = log_dir / "webhook_raw.log"
+
+    if webhook_log_file.exists():
+        try:
+            with open(webhook_log_file, 'w', encoding='utf-8') as f:
+                f.truncate(0)
+            logging.info(f"已清空旧的 Webhook 原始请求日志: {webhook_log_file}")
+        except IOError as e:
+            logging.error(f"清空 Webhook 原始请求日志失败: {e}")
+
+    webhook_logger = logging.getLogger("webhook_raw")
+    webhook_logger.setLevel(logging.INFO) # 只记录 INFO 级别及以上的日志
+    webhook_logger.propagate = False # 防止日志冒泡到根记录器
+
+    webhook_handler = logging.handlers.RotatingFileHandler(
+        webhook_log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
+    )
+    # 为这个日志使用一个非常简洁的格式，只包含时间和消息
+    webhook_handler.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    webhook_logger.addHandler(webhook_handler)
+    logging.info("专用的 Webhook 原始请求日志已初始化，将输出到 %s", webhook_log_file)
+
 def get_logs() -> List[str]:
     """返回为API存储的所有日志条目列表。"""
     return list(_logs_deque)
+
+
+def subscribe_to_logs(queue: asyncio.Queue) -> None:
+    """订阅日志更新。"""
+    _log_subscribers.add(queue)
+
+
+def unsubscribe_from_logs(queue: asyncio.Queue) -> None:
+    """取消订阅日志更新。"""
+    _log_subscribers.discard(queue)

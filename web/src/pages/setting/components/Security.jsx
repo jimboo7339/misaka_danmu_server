@@ -5,7 +5,11 @@ import {
 } from '@ant-design/icons'
 import { Button, Card, Form, Input, message } from 'antd'
 import { useState } from 'react'
-import { changePassword } from '../../../apis'
+import { changePassword, logout } from '../../../apis'
+import { useMessage } from '../../../MessageContext'
+import { useNavigate } from 'react-router-dom'
+import { RoutePaths } from '../../../general/RoutePaths'
+import Cookies from 'js-cookie'
 
 export const Security = () => {
   const [form] = Form.useForm()
@@ -13,6 +17,8 @@ export const Security = () => {
   const [showPassword2, setShowPassword2] = useState(false)
   const [showPassword3, setShowPassword3] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
+  const messageApi = useMessage()
+  const navigate = useNavigate()
 
   const onSave = async () => {
     try {
@@ -20,17 +26,39 @@ export const Security = () => {
       const values = await form.validateFields()
       await changePassword(values)
       form.resetFields()
-      message.success('修改成功')
+      messageApi.success('修改成功')
     } catch (error) {
-      message.error('修改失败')
+      // 优先从 error.response.data.detail 获取（直接来自后端）
+      const detail = error.response?.data?.detail || error.detail
+
+      let errorMsg = '修改失败'
+
+      if (Array.isArray(detail)) {
+        // Pydantic 422 验证错误：[{loc, msg, type}, ...]
+        errorMsg = detail.map(err => err.msg || JSON.stringify(err)).join('; ')
+      } else if (typeof detail === 'string') {
+        // 业务逻辑错误：字符串
+        errorMsg = detail
+      } else if (error.message && typeof error.message === 'string') {
+        // fetch.js 拦截器添加的 message 字段
+        errorMsg = error.message
+      }
+
+      messageApi.error(errorMsg)
     } finally {
       setIsLoading(false)
     }
   }
 
+  const onLogout = async () => {
+    await logout()
+    Cookies.remove('danmu_token', { path: '/' })
+    navigate(RoutePaths.LOGIN)
+  }
+
   return (
     <div className="my-6">
-      <Card title="修改密码">
+      <Card title="修改密码" className="mb-4">
         <div className="mb-4">
           如果您是使用初始随机密码登录的，建议您在此修改为自己的密码。
         </div>
@@ -115,6 +143,17 @@ export const Security = () => {
             </div>
           </Form.Item>
         </Form>
+      </Card>
+
+      <Card title="退出登录">
+        <div className="mb-4">
+          退出当前账户，返回登录页面。
+        </div>
+        <div className="px-6 pb-6">
+          <Button type="primary" danger onClick={onLogout}>
+            退出登录
+          </Button>
+        </div>
       </Card>
     </div>
   )

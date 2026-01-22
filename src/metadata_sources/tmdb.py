@@ -2,11 +2,13 @@ import asyncio
 import logging
 import re
 from typing import Any, Dict, List, Optional, Set, cast
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
-from .. import crud, models
+from .. import crud, models, utils
+from ..config_manager import ConfigManager
 from .base import BaseMetadataSource
 
 from fastapi import HTTPException, status
@@ -21,8 +23,54 @@ def _clean_movie_title(title: Optional[str]) -> Optional[str]:
     cleaned_title = re.sub(r'\s{2,}', ' ', cleaned_title).strip().strip(':- ')
     return cleaned_title
 
+async def _get_proxy_for_tmdb(config_manager: ConfigManager, session_factory: async_sessionmaker[AsyncSession]) -> Optional[str]:
+    """
+    Helper to determine if a proxy should be used for TMDB.
+
+    支持三种代理模式：
+    - none: 不使用代理
+    - http_socks: HTTP/SOCKS 代理
+    - accelerate: 加速代理（URL 重写模式，不返回代理 URL）
+    """
+    # 获取代理模式
+    proxy_mode = await config_manager.get("proxyMode", "none")
+
+    # 兼容旧配置：如果 proxyMode 为 none 但 proxyEnabled 为 true，则使用 http_socks 模式
+    if proxy_mode == "none":
+        proxy_enabled_globally = (await config_manager.get("proxyEnabled", "false")).lower() == 'true'
+        if proxy_enabled_globally:
+            proxy_mode = "http_socks"
+
+    # 如果代理模式为 none 或 accelerate，则不返回 HTTP 代理 URL
+    # accelerate 模式通过 URL 重写实现，不需要设置 httpx 的 proxy 参数
+    if proxy_mode != "http_socks":
+        return None
+
+    proxy_url = await config_manager.get("proxyUrl", "")
+    if not proxy_url:
+        return None
+
+    async with session_factory() as session:
+        metadata_settings = await crud.get_all_metadata_source_settings(session)
+
+    provider_setting = next((s for s in metadata_settings if s['providerName'] == 'tmdb'), None)
+    use_proxy = provider_setting.get('useProxy', False) if provider_setting else False
+
+    return proxy_url if use_proxy else None
+
 class TmdbMetadataSource(BaseMetadataSource):
     provider_name = "tmdb"
+
+    @property
+    async def test_url(self) -> str:
+        """
+        动态地从配置中获取测试URL。
+        这确保了代理测试和连接性检查使用的是用户配置的域名。
+        """
+        base_url_from_config = await self.config_manager.get("tmdbApiBaseUrl", "https://api.themoviedb.org/3")
+        # 测试URL应该是基础域名，不应包含 /3 这样的API路径
+        cleaned_domain = base_url_from_config.rstrip('/')
+        return re.sub(r'/3/?$', '', cleaned_domain)
 
     async def _get_robust_image_base_url(self) -> str:
         """
@@ -49,30 +97,50 @@ class TmdbMetadataSource(BaseMetadataSource):
         base_url = cleaned_domain if cleaned_domain.endswith('/3') else f"{cleaned_domain}/3"
         
         params = {"api_key": api_key, "language": "zh-CN"}
-        return httpx.AsyncClient(base_url=base_url, params=params, timeout=20.0, follow_redirects=True)
+        proxy_to_use = await _get_proxy_for_tmdb(self.config_manager, self._session_factory)
+        if proxy_to_use:
+            self.logger.debug(f"TMDB: 将使用代理: {proxy_to_use}")
+        return httpx.AsyncClient(base_url=base_url, params=params, timeout=20.0, follow_redirects=True, proxy=proxy_to_use)
 
     async def search(self, keyword: str, user: models.User, mediaType: Optional[str] = None) -> List[models.MetadataDetailsResponse]:
         if not mediaType:
-            raise ValueError("TMDB search requires a mediaType ('tv' or 'movie').")
-        
+            raise ValueError("TMDB search requires a mediaType ('tv', 'movie', or 'multi').")
+
         try:
             async with await self._create_client() as client:
                 response = await client.get(f"/search/{mediaType}", params={"query": keyword})
                 response.raise_for_status()
                 data = response.json().get("results", [])
-                
+
                 image_base_url = await self._get_robust_image_base_url()
-                
+
                 results = []
                 for item in data:
-                    title = item.get('name') if mediaType == 'tv' else item.get('title')
-                    release_date = item.get('first_air_date') if mediaType == 'tv' else item.get('release_date')
+                    # 对于 multi 搜索，需要从 media_type 字段获取类型
+                    item_media_type = item.get('media_type') if mediaType == 'multi' else mediaType
+
+                    # 跳过非 tv/movie 类型的结果（如 person）
+                    if item_media_type not in ['tv', 'movie']:
+                        continue
+
+                    title = item.get('name') if item_media_type == 'tv' else item.get('title')
+                    release_date = item.get('first_air_date') if item_media_type == 'tv' else item.get('release_date')
                     details_str = f"{release_date or '未知年份'} / {item.get('original_language', 'N/A')}"
-                    
+
+                    # 提取年份
+                    year = None
+                    if release_date:
+                        try:
+                            year = int(release_date[:4])
+                        except (ValueError, TypeError):
+                            pass
+
                     results.append(models.MetadataDetailsResponse(
                         id=str(item['id']),
                         tmdbId=str(item['id']),
                         title=title,
+                        type=item_media_type,  # 使用实际的媒体类型
+                        year=year,  # 添加年份字段
                         imageUrl=f"{image_base_url}{item.get('poster_path')}" if item.get('poster_path') else None,
                         details=details_str
                     ))
@@ -87,16 +155,47 @@ class TmdbMetadataSource(BaseMetadataSource):
 
         try:
             async with await self._create_client() as client:
-                response = await client.get(f"/{mediaType}/{item_id}", params={"append_to_response": "alternative_titles,external_ids"})
+                # 1. Get main details in Chinese
+                response = await client.get(f"/{mediaType}/{item_id}", params={"append_to_response": "external_ids"})
                 if response.status_code == 404:
                     return None
                 response.raise_for_status()
                 details = response.json()
 
+                # 2. Get all aliases using the new comprehensive method
+                aliases = await self._fetch_and_structure_aliases(client, item_id, mediaType)
+
                 image_base_url = await self._get_robust_image_base_url()
-                
-                aliases = self._parse_tmdb_details_for_aliases(details)
-                
+
+                # 3. 提取年份信息
+                release_date = details.get('first_air_date') if mediaType == 'tv' else details.get('release_date')
+                year = None
+                if release_date:
+                    try:
+                        year = int(release_date[:4])
+                    except (ValueError, TypeError):
+                        pass
+
+                # 4. 提取seasons信息(仅TV系列)
+                seasons_data = None
+                if mediaType == 'tv' and details.get('seasons'):
+                    seasons_data = []
+                    for season in details.get('seasons', []):
+                        try:
+                            seasons_data.append(models.TMDBSeasonInfo(
+                                airDate=season.get('air_date'),
+                                episodeCount=season.get('episode_count', 0),
+                                id=season.get('id'),
+                                name=season.get('name', ''),
+                                seasonNumber=season.get('season_number', 0),
+                                posterPath=season.get('poster_path'),
+                                aliases=[]  # TMDB API不直接提供季度别名，留空给后续填充
+                            ))
+                        except Exception as e:
+                            self.logger.warning(f"解析season信息失败: {e}")
+                            continue
+
+                # 5. Construct the response
                 return models.MetadataDetailsResponse(
                     id=str(details['id']),
                     tmdbId=str(details['id']),
@@ -105,46 +204,83 @@ class TmdbMetadataSource(BaseMetadataSource):
                     nameJp=aliases.get("name_jp"),
                     nameRomaji=aliases.get("name_romaji"),
                     aliasesCn=aliases.get("aliases_cn", []),
+                    aliasesJp=aliases.get("aliases_jp", []),  # 新增：日文别名列表
                     imageUrl=f"{image_base_url}{details.get('poster_path')}" if details.get('poster_path') else None,
                     details=details.get('overview'),
+                    year=year,
                     imdbId=details.get('external_ids', {}).get('imdb_id'),
-                    tvdbId=str(details.get('external_ids', {}).get('tvdb_id')) if details.get('external_ids', {}).get('tvdb_id') else None
+                    tvdbId=str(details.get('external_ids', {}).get('tvdb_id')) if details.get('external_ids', {}).get('tvdb_id') else None,
+                    seasons=seasons_data
                 )
         except ValueError as e:
             # 捕获 _create_client 中的 API Key 未配置错误
             raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail=str(e))
 
-    def _parse_tmdb_details_for_aliases(self, details: Dict[str, Any]) -> Dict[str, Any]:
-        name_en, name_jp, name_romaji, aliases_cn = None, None, None, []
-        original_title = details.get('original_name') or details.get('original_title')
-        original_language = details.get('original_language')
-        main_title_cn = details.get('name') or details.get('title')
+    async def _fetch_and_structure_aliases(self, client: httpx.AsyncClient, tmdb_id: str, media_type: str) -> Dict[str, Any]:
+        """
+        一个更全面的别名获取逻辑，结合了特定语言的详情获取和alternative_titles端点。
+        修复：现在收集所有日文别名到列表中，而不是只保留一个。
+        """
+        api_path = f"/{media_type}/{tmdb_id}"
+        name_en, name_jp, name_romaji = None, None, None
+        aliases_cn: set[str] = set()
+        aliases_jp: set[str] = set()  # 新增：日文别名集合
 
-        if alt_titles := details.get('alternative_titles', {}).get('titles', []):
-            found_titles = {}
-            for alt_title in alt_titles:
-                iso_code = alt_title.get('iso_3166_1')
-                title = alt_title.get('title')
-                if iso_code in ["CN", "HK", "TW", "SG"]:
-                    aliases_cn.append(title)
-                elif iso_code == "JP":
-                    if alt_title.get('type') == "Romaji":
-                        if 'romaji' not in found_titles: found_titles['romaji'] = title
-                    elif not alt_title.get('type'):
-                        if 'jp' not in found_titles: found_titles['jp'] = title
-                elif iso_code in ["US", "GB"]:
-                    if 'en' not in found_titles: found_titles['en'] = title
-            name_en, name_jp, name_romaji = found_titles.get('en'), found_titles.get('jp'), found_titles.get('romaji')
+        # 1. 获取特定语言的主标题
+        try:
+            zh_res = await client.get(api_path, params={"language": "zh-CN"})
+            if zh_res.status_code == 200:
+                if title := zh_res.json().get('name') or zh_res.json().get('title'): aliases_cn.add(title)
+        except Exception as e:
+            self.logger.warning(f"获取 TMDB 中文标题失败 (ID: {tmdb_id}): {e}")
 
-        if not name_en and original_language == 'en': name_en = original_title
-        if not name_jp and original_language == 'ja': name_jp = original_title
-        if main_title_cn: aliases_cn.append(main_title_cn)
-        
+        try:
+            en_res = await client.get(api_path, params={"language": "en-US"})
+            if en_res.status_code == 200:
+                name_en = en_res.json().get('name') or en_res.json().get('title')
+        except Exception as e:
+            self.logger.warning(f"获取 TMDB 英文标题失败 (ID: {tmdb_id}): {e}")
+
+        try:
+            ja_res = await client.get(api_path, params={"language": "ja-JP"})
+            if ja_res.status_code == 200:
+                if title := ja_res.json().get('name') or ja_res.json().get('title'):
+                    name_jp = title
+                    aliases_jp.add(title)  # 同时添加到别名列表
+        except Exception as e:
+            self.logger.warning(f"获取 TMDB 日文标题失败 (ID: {tmdb_id}): {e}")
+
+        # 2. 获取所有别名
+        try:
+            alt_res = await client.get(f"{api_path}/alternative_titles")
+            if alt_res.status_code == 200:
+                alt_titles_data = alt_res.json()
+                alt_titles = alt_titles_data.get("results") or alt_titles_data.get("titles", [])
+                for alt in alt_titles:
+                    iso_code = alt.get('iso_3166_1')
+                    title = alt.get('title')
+                    if not title: continue
+
+                    if iso_code in ["CN", "HK", "TW", "SG"]:
+                        aliases_cn.add(title)
+                    elif iso_code == "JP":
+                        if alt.get('type') == "Romaji":
+                            if not name_romaji: name_romaji = title
+                        else:
+                            # 修复：添加到日文别名列表，而不是覆盖 name_jp
+                            aliases_jp.add(title)
+                            if not name_jp: name_jp = title  # 只在 name_jp 为空时设置
+                    elif iso_code in ["US", "GB"]:
+                        if not name_en: name_en = title
+        except Exception as e:
+            self.logger.warning(f"获取 TMDB 别名失败 (ID: {tmdb_id}): {e}")
+
         return {
             "name_en": _clean_movie_title(name_en),
             "name_jp": _clean_movie_title(name_jp),
             "name_romaji": _clean_movie_title(name_romaji),
-            "aliases_cn": list(dict.fromkeys([_clean_movie_title(a) for a in aliases_cn if a]))
+            "aliases_cn": list(dict.fromkeys([_clean_movie_title(a) for a in aliases_cn if a])),
+            "aliases_jp": list(dict.fromkeys([_clean_movie_title(a) for a in aliases_jp if a]))  # 新增：返回日文别名列表
         }
 
     async def search_aliases(self, keyword: str, user: models.User) -> Set[str]:
@@ -178,21 +314,28 @@ class TmdbMetadataSource(BaseMetadataSource):
         return {alias for alias in aliases if alias}
 
     async def check_connectivity(self) -> str:
+        """检查TMDB源配置状态"""
         try:
-            async with await self._create_client() as client:
-                response = await client.get("/configuration")
-                return "连接成功" if response.status_code == 200 else f"连接失败 (状态码: {response.status_code})"
-        except ValueError as e: # API Key not configured
-            return f"未配置: {e}"
-        except Exception as e:
-            return f"连接失败: {e}"
+            # 检查API Key配置
+            api_key = await self.config_manager.get("tmdbApiKey", "")
+            if not api_key or api_key.strip() == "":
+                return "未配置 (缺少TMDB API Key)"
 
-    async def execute_action(self, action_name: str, payload: Dict[str, Any], user: models.User) -> Any:
+            # 检查API Key格式是否合理 (TMDB API Key通常是32位十六进制字符串)
+            if len(api_key.strip()) < 20:
+                return "配置异常 (API Key格式不正确)"
+
+            return "配置正常"
+        except Exception as e:
+            return f"配置检查失败: {e}"
+
+    async def execute_action(self, action_name: str, payload: Dict[str, Any], user: models.User, request: Any) -> Any:
         try:
             async with await self._create_client() as client:
                 if action_name == "get_episode_groups":
                     tmdb_id = payload.get("tmdbId")
-                    if not tmdb_id: raise ValueError("缺少 tmdbId")
+                    if not tmdb_id:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="缺少 tmdbId")
                     response = await client.get(f"/tv/{tmdb_id}/episode_groups")
                     response.raise_for_status()
                     raw_results = response.json().get("results", [])
@@ -212,20 +355,51 @@ class TmdbMetadataSource(BaseMetadataSource):
                 elif action_name == "get_all_episodes":
                     egid = payload.get("egid")
                     tmdb_id = payload.get("tmdbId")
-                    if not egid or not tmdb_id: raise ValueError("缺少 egid 或 tmdbId")
+                    if not egid or not tmdb_id:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="缺少 egid 或 tmdbId")
                     response = await client.get(f"/tv/episode_group/{egid}", params={"language": "zh-CN"})
                     response.raise_for_status()
                     return response.json()
                 elif action_name == "update_mappings":
                     tmdb_id = payload.get("tmdbId")
                     group_id = payload.get("groupId")
-                    if not tmdb_id or not group_id: raise ValueError("缺少 tmdbId 或 groupId")
+                    if not tmdb_id or not group_id:
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="缺少 tmdbId 或 groupId")
                     await self.update_tmdb_mappings(int(tmdb_id), group_id, user)
                     return {"message": "映射更新成功"}
-                return await super().execute_action(action_name, payload, user)
+                
+                raise NotImplementedError(f"操作 '{action_name}' 在 {self.provider_name} 中未实现。")
         except ValueError as e:
             # 捕获 _create_client 中的 API Key 未配置错误
             raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail=str(e))
+
+    async def get_all_episode_groups(self, tmdb_id: int, user: models.User) -> List[Dict[str, Any]]:
+        """
+        获取指定TMDB TV ID的所有剧集组信息。
+        返回剧集组列表，每个剧集组包含id、name、type等信息。
+        """
+        try:
+            async with await self._create_client() as client:
+                response = await client.get(f"/tv/{tmdb_id}/episode_groups")
+                response.raise_for_status()
+                raw_results = response.json().get("results", [])
+
+                # 转换为驼峰命名格式
+                camel_case_results = []
+                for item in raw_results:
+                    camel_case_results.append({
+                        "description": item.get("description"),
+                        "episodeCount": item.get("episode_count"),
+                        "groupCount": item.get("group_count"),
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                        "network": item.get("network"),
+                        "type": item.get("type"),
+                    })
+                return camel_case_results
+        except Exception as e:
+            self.logger.error(f"获取剧集组失败 (TMDB ID: {tmdb_id}): {e}")
+            return []
 
     async def update_tmdb_mappings(self, tmdb_tv_id: int, group_id: str, user: models.User):
         """
@@ -237,7 +411,9 @@ class TmdbMetadataSource(BaseMetadataSource):
             # 1. 获取剧集组详情
             response = await client.get(f"/tv/episode_group/{group_id}", params={"language": "zh-CN"})
             response.raise_for_status()
-            group_details = models.TMDBEpisodeGroupDetails.model_validate(response.json())
+            api_data = response.json()
+            camel_case_data = utils.convert_keys_to_camel(api_data)
+            group_details = models.TMDBEpisodeGroupDetails.model_validate(camel_case_data)
 
             # 2. (可选) 丰富分集信息，例如获取日文标题和图片
             # This part can be extended if needed. For now, we focus on mapping.

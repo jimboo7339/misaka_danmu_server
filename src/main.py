@@ -1,17 +1,25 @@
+import time
 import uvicorn
 import asyncio
 import secrets
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Depends, status
 import httpx
 import logging
+import json
+from contextlib import asynccontextmanager
+from pathlib import Path
+from fastapi import FastAPI, Request, Depends, status
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, JSONResponse, Response # noqa: F401
-from fastapi.middleware.cors import CORSMiddleware  # 新增：处理跨域
-import json
+from fastapi.middleware.cors import CORSMiddleware
+
+# 内部模块导入
 from .config_manager import ConfigManager
+from .cache_manager import CacheManager
+from .ai.ai_matcher_manager import AIMatcherManager
 from .database import init_db_tables, close_db_engine, create_initial_admin_user
-from .api import api_router
+from .internal_polling import InternalPollingManager
+from .api import api_router, control_router
 from .dandan_api import dandan_router
 from .task_manager import TaskManager
 from .metadata_manager import MetadataSourceManager
@@ -19,23 +27,81 @@ from .scraper_manager import ScraperManager
 from .webhook_manager import WebhookManager
 from .scheduler import SchedulerManager
 from .config import settings
-from . import crud, security
+from . import crud, security, orm_models
 from .log_manager import setup_logging
 from .rate_limiter import RateLimiter
-
-print(f"当前环境: {settings.environment}") 
+from ._version import APP_VERSION
+from .ai.ai_prompts import DEFAULT_AI_MATCH_PROMPT, DEFAULT_AI_RECOGNITION_PROMPT, DEFAULT_AI_ALIAS_VALIDATION_PROMPT, DEFAULT_AI_ALIAS_EXPANSION_PROMPT, DEFAULT_AI_SEASON_MAPPING_PROMPT
+from .title_recognition import TitleRecognitionManager
+from .media_server_manager import MediaServerManager
+from .default_configs import get_default_configs
+from .database import get_db_type
+from .transport_manager import TransportManager
+from .proxy_middleware import init_proxy_middleware
+from sqlalchemy import text
+    
+print(f"当前环境: {settings.environment}")
 
 logger = logging.getLogger(__name__)
+
+def _is_docker_environment():
+    """检测是否在Docker容器中运行"""
+    import os
+    # 方法1: 检查 /.dockerenv 文件（Docker标准做法）
+    if Path("/.dockerenv").exists():
+        return True
+    # 方法2: 检查环境变量
+    if os.getenv("DOCKER_CONTAINER") == "true" or os.getenv("IN_DOCKER") == "true":
+        return True
+    # 方法3: 检查当前工作目录是否为 /app
+    if Path.cwd() == Path("/app"):
+        return True
+    return False
+
+def _ensure_required_directories():
+    """确保应用运行所需的目录存在"""
+    if _is_docker_environment():
+        required_dirs = [
+            Path("/app/config/image"),
+        ]
+    else:
+        required_dirs = [
+            Path("config/image"),
+        ]
+
+    for dir_path in required_dirs:
+        try:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"确保目录存在: {dir_path}")
+        except (OSError, PermissionError) as e:
+            logger.warning(f"无法创建目录 {dir_path}: {e}")
+
+def _get_default_danmaku_path_template():
+    """根据运行环境获取默认弹幕路径模板"""
+
+    if _is_docker_environment():
+        return '/app/config/danmaku/${animeId}/${episodeId}'
+    else:
+        return 'config/danmaku/${animeId}/${episodeId}'
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     应用生命周期管理器。
-    - `yield` 之前的部分在应用启动时执行。 
-    - `yield` 之后的部分在应用关闭时执行。
+    - `yield` 之前的部分在应用启动时执行。
+            try:
+                await app.state.metadata_manager.close_all()
+            except Exception as e:
+                logger.exception(f"关闭 MetadataManager 时发生错误: {e}")
     """
     # --- Startup Logic ---
     setup_logging()
+
+    # 新增：在日志系统初始化后立即打印版本号
+    logger.info(f"Misaka Danmaku API 版本 {APP_VERSION} 正在启动...")
+
+    # 创建必要的目录
+    _ensure_required_directories()
 
     # init_db_tables 现在处理数据库创建、引擎和会话工厂的创建
     await init_db_tables(app)
@@ -46,100 +112,256 @@ async def lifespan(app: FastAPI):
         interrupted_count = await crud.mark_interrupted_tasks_as_failed(session)
         if interrupted_count > 0:
             logging.getLogger(__name__).info(f"已将 {interrupted_count} 个中断的任务标记为失败。")
-    
-    # 新增：初始化配置管理器
+
+
+    # 新增:PostgreSQL序列自动修复(防止主键冲突)
+    if get_db_type() == "postgresql":
+        async with session_factory() as session:
+            try:
+                await session.execute(text(
+                    "SELECT setval('anime_id_seq', (SELECT COALESCE(MAX(id), 0) FROM anime))"
+                ))
+                await session.commit()
+                logger.info("已自动同步PostgreSQL的anime_id_seq序列")
+            except Exception as e:
+                logger.warning(f"同步PostgreSQL序列时出错(可忽略): {e}")
+
+    # 初始化配置管理器
     app.state.config_manager = ConfigManager(session_factory)
-    # 新增：集中定义所有默认配置
-    default_configs = {
-        # 缓存 TTL
-        'jwtSecretKey': (secrets.token_hex(32), '用于签名JWT令牌的密钥，在首次启动时自动生成。'),
-        'searchTtlSeconds': (10800, '搜索结果的缓存时间（秒），最低3小时。'),
-        'episodesTtlSeconds': (10800, '分集列表的缓存时间（秒），最低3小时。'),
-        'baseInfoTtlSeconds': (10800, '基础媒体信息（如爱奇艺）的缓存时间（秒），最低3小时。'),
-        'metadataSearchTtlSeconds': (10800, '元数据（如TMDB, Bangumi）搜索结果的缓存时间（秒），最低3小时。'),
-        # API 和 Webhook
-        'customApiDomain': ('', '用于拼接弹幕API地址的自定义域名。'),
-        'webhookApiKey': ('', '用于Webhook调用的安全密钥。'),
-        'externalApiKey': ('', '用于外部API调用的安全密钥。'),
-        'webhookCustomDomain': ('', '用于拼接Webhook URL的自定义域名。'),
-        # 认证
-        # 代理
-        'proxyUrl': ('', '全局HTTP/HTTPS/SOCKS5代理地址。'),
-        'proxyEnabled': ('false', '是否全局启用代理。'),
-        'jwtExpireMinutes': (settings.jwt.access_token_expire_minutes, 'JWT令牌的有效期（分钟）。-1 表示永不过期。'),
-        # 元数据源
-        'tmdbApiKey': ('', '用于访问 The Movie Database API 的密钥。'),
-        'tmdbApiBaseUrl': ('https://api.themoviedb.org', 'TMDB API 的基础域名。'),
-        'tmdbImageBaseUrl': ('https://image.tmdb.org', 'TMDB 图片服务的基础 URL。'),
-        'tvdbApiKey': ('', '用于访问 TheTVDB API 的密钥。'),
-        'bangumiClientId': ('', '用于Bangumi OAuth的App ID。'),
-        'bangumiClientSecret': ('', '用于Bangumi OAuth的App Secret。'),
-        'doubanCookie': ('', '用于访问豆瓣API的Cookie。'),
-        # 弹幕源
-        'danmakuOutputLimitPerSource': ('-1', '单源弹幕输出总数限制。-1为无限制。'),
-        'danmakuAggregationEnabled': ('true', '是否启用跨源弹幕聚合功能。'),
-        'scraperVerificationEnabled': ('false', '是否启用搜索源签名验证。'),
-        'bilibiliCookie': ('', '用于访问B站API的Cookie，特别是buvid3。'),
-        'gamerCookie': ('', '用于访问巴哈姆特动画疯的Cookie。'),
-        'gamerUserAgent': ('', '用于访问巴哈姆特动画疯的User-Agent。'),
-        "rate_limit_global_limit": ("50", ""),
-        "rate_limit_global_period_seconds": ("3600", ""),
+
+    # 注册默认配置(从default_configs.py导入)
+    ai_prompts = {
+        'DEFAULT_AI_MATCH_PROMPT': DEFAULT_AI_MATCH_PROMPT,
+        'DEFAULT_AI_RECOGNITION_PROMPT': DEFAULT_AI_RECOGNITION_PROMPT,
+        'DEFAULT_AI_ALIAS_VALIDATION_PROMPT': DEFAULT_AI_ALIAS_VALIDATION_PROMPT,
+        'DEFAULT_AI_ALIAS_EXPANSION_PROMPT': DEFAULT_AI_ALIAS_EXPANSION_PROMPT,
+        'DEFAULT_AI_SEASON_MAPPING_PROMPT': DEFAULT_AI_SEASON_MAPPING_PROMPT,
     }
+    default_configs = get_default_configs(settings=settings, ai_prompts=ai_prompts)
+    # 添加运行时生成的配置
+    default_configs['jwtSecretKey'] = (secrets.token_hex(32), '用于签名JWT令牌的密钥，在首次启动时自动生成。')
+
     await app.state.config_manager.register_defaults(default_configs)
 
-    app.state.scraper_manager = ScraperManager(session_factory, app.state.config_manager)
-    await app.state.scraper_manager.initialize()
-    app.state.rate_limiter = RateLimiter(session_factory, app.state.config_manager, app.state.scraper_manager)
+    # 初始化 TransportManager
+    app.state.transport_manager = TransportManager()
 
-    # 新增：初始化元数据源管理器
-    app.state.metadata_manager = MetadataSourceManager(session_factory, app.state.config_manager)
-    await app.state.metadata_manager.initialize()
+    # 初始化 CacheManager
+    app.state.cache_manager = CacheManager(session_factory)
+    logger.info("缓存管理器已初始化")
 
-    app.state.task_manager = TaskManager(session_factory)
-    # 修正：将 ConfigManager 传递给 WebhookManager
-    app.state.webhook_manager = WebhookManager(
-        session_factory, app.state.task_manager, app.state.scraper_manager, app.state.config_manager, app.state.rate_limiter
+    # 初始化 ProxyMiddleware
+    app.state.proxy_middleware = init_proxy_middleware(app.state.config_manager)
+    logger.info("代理中间件已初始化")
+
+    # 初始化 AIMatcherManager（传入 session_factory 用于 AI 调用统计持久化）
+    app.state.ai_matcher_manager = AIMatcherManager(app.state.config_manager, session_factory)
+    logger.info("AI匹配管理器已初始化")
+
+    # --- 并行优化的初始化顺序 ---
+    startup_start = time.time()
+
+    # 1-3. 创建管理器实例（不阻塞）
+    app.state.metadata_manager = MetadataSourceManager(session_factory, app.state.config_manager, None, app.state.cache_manager)
+    app.state.scraper_manager = ScraperManager(session_factory, app.state.config_manager, app.state.metadata_manager, app.state.transport_manager)
+    app.state.metadata_manager.scraper_manager = app.state.scraper_manager
+
+    # 4. 【并行优化】同时初始化 + 预热
+    logger.info("开始并行初始化...")
+    init_start = time.time()
+
+    # 先并行初始化两个管理器
+    await asyncio.gather(
+        app.state.scraper_manager.initialize(),
+        app.state.metadata_manager.initialize()
     )
+
+    # 【优化】预加载所有配置到缓存
+    logger.info("预加载配置缓存...")
+    async with session_factory() as session:
+        # 预加载代理相关配置
+        proxy_mode = await crud.get_config_value(session, "proxyMode", "none")
+        proxy_url = await crud.get_config_value(session, "proxyUrl", "")
+        proxy_enabled = await crud.get_config_value(session, "proxyEnabled", "false")
+        accelerate_proxy_url = await crud.get_config_value(session, "accelerateProxyUrl", "")
+        app.state.config_manager._cache["proxyMode"] = proxy_mode
+        app.state.config_manager._cache["proxyUrl"] = proxy_url
+        app.state.config_manager._cache["proxyEnabled"] = proxy_enabled
+        app.state.config_manager._cache["accelerateProxyUrl"] = accelerate_proxy_url
+
+        # 一次性查询所有 scraper 设置并缓存
+        scraper_settings = await crud.get_all_scraper_settings(session)
+        # 存储到 scraper_manager 中供后续使用,避免重复查询
+        app.state.scraper_manager._cached_scraper_settings = {
+            s['providerName']: s for s in scraper_settings
+        }
+
+    # 初始化关键组件（同步执行，确保启动正常）
+    app.state.rate_limiter = RateLimiter(session_factory, app.state.scraper_manager)
+    app.include_router(app.state.metadata_manager.router, prefix="/api/metadata")
+
+    # Add bangumi specific routes with /bangumi prefix
+    if 'bangumi' in app.state.metadata_manager.sources:
+        bangumi_router = app.state.metadata_manager.sources['bangumi'].api_router
+        app.include_router(bangumi_router, prefix="/api/bangumi", tags=["Bangumi"])
+
+
+
+    app.state.task_manager = TaskManager(session_factory, app.state.config_manager)
+
+    # 初始化识别词管理器
+    app.state.title_recognition_manager = TitleRecognitionManager(session_factory)
+
+    # 初始化媒体服务器管理器
+    app.state.media_server_manager = MediaServerManager(session_factory)
+    await app.state.media_server_manager.initialize()
+
+    app.state.webhook_manager = WebhookManager(
+        session_factory, app.state.task_manager, app.state.scraper_manager,
+        app.state.rate_limiter, app.state.metadata_manager,
+        app.state.config_manager, app.state.title_recognition_manager,
+        app.state.ai_matcher_manager
+    )
+
+    init_time = time.time() - init_start
+    logger.info(f"并行初始化完成，耗时 {init_time:.2f} 秒")
+
+    # 设置任务恢复所需的依赖，用于重启后恢复排队中的任务
+    app.state.task_manager.set_recovery_dependencies({
+        "scraper_manager": app.state.scraper_manager,
+        "rate_limiter": app.state.rate_limiter,
+        "metadata_manager": app.state.metadata_manager,
+        "ai_matcher_manager": app.state.ai_matcher_manager,
+        "title_recognition_manager": app.state.title_recognition_manager,
+    })
+
+    # 5. 启动服务（必须在上面完成后）
     app.state.task_manager.start()
     await create_initial_admin_user(app)
+
+    async with session_factory() as session:
+        existing_task = await session.get(orm_models.ScheduledTask, "system_token_reset")
+        if not existing_task:
+            await crud.create_scheduled_task(
+                session,
+                task_id="system_token_reset",
+                name="系统内置：Token每日重置",
+                job_type="tokenReset",
+                cron="0 0 * * *",
+                is_enabled=True
+            )
+
     app.state.cleanup_task = asyncio.create_task(cleanup_task(app))
-    app.state.scheduler_manager = SchedulerManager(session_factory, app.state.task_manager, app.state.scraper_manager, app.state.rate_limiter)
+    app.state.scheduler_manager = SchedulerManager(
+        session_factory, app.state.task_manager, app.state.scraper_manager,
+        app.state.rate_limiter, app.state.metadata_manager,
+        app.state.config_manager, app.state.ai_matcher_manager,
+        app.state.title_recognition_manager
+    )
     await app.state.scheduler_manager.start()
-    
+
+    # 内置轮询任务管理器（任务在 start() 中自动注册）
+    app.state.internal_polling = InternalPollingManager(app)
+    await app.state.internal_polling.start()
+
+    total_time = time.time() - startup_start
+    logger.info(f"应用启动完成，总耗时 {total_time:.2f} 秒")
+
+    # --- 前端服务 ---
+    # 在所有API路由注册完毕后，再挂载前端服务，以确保API路由优先匹配。
+
+    # 无论开发还是生产环境，都需要挂载用户缓存的图片
+    # 这样开发环境下前端通过代理也能访问到这些资源
+    app.mount("/data/images", StaticFiles(directory="config/image"), name="cached_images")
+
+    # 在生产环境中，我们需要挂载 Vite 构建后的静态资源目录
+    # 并且需要一个"捕获所有"的路由来始终提供 index.html，以支持前端路由。
+    if settings.environment == "development":
+        # 开发环境：所有非API请求都重定向到Vite开发服务器
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def serve_react_app_dev(request: Request, full_path: str):
+            base_url = f"http://{settings.client.host}:{settings.client.port}"
+            return RedirectResponse(url=f"{base_url}/{full_path}" if full_path else base_url)
+    else:
+        # 生产环境：显式挂载静态资源目录
+        app.mount("/assets", StaticFiles(directory="web/dist/assets"), name="assets")
+        # 修正：挂载前端的静态图片 (如 logo)，使其指向正确的 'web/dist/images' 目录
+        app.mount("/images", StaticFiles(directory="web/dist/images"), name="images")
+        # dist挂载
+        app.mount("/dist", StaticFiles(directory="web/dist"), name="dist")
+        # 然后，为所有其他路径提供 index.html 以支持前端路由
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def serve_spa(request: Request, full_path: str):
+            return FileResponse("web/dist/index.html")
+
     yield
-    
+
     # --- Shutdown Logic ---
+    logger.info("应用正在关闭...")
+
     if hasattr(app.state, "cleanup_task"):
         app.state.cleanup_task.cancel()
         try:
             await app.state.cleanup_task
         except asyncio.CancelledError:
             pass
+
     await close_db_engine(app)
     if hasattr(app.state, "scraper_manager"):
         await app.state.scraper_manager.close_all()
+    # 关闭 TransportManager
+    if hasattr(app.state, "transport_manager"):
+        try:
+            await app.state.transport_manager.close_all()
+        except Exception as e:
+            logger.exception(f"关闭 TransportManager 时发生错误: {e}")
     if hasattr(app.state, "task_manager"):
         await app.state.task_manager.stop()
+    # 新增：在关闭时也关闭元数据管理器
+    if hasattr(app.state, "metadata_manager"):
+        await app.state.metadata_manager.close_all()
+    if hasattr(app.state, "media_server_manager"):
+        await app.state.media_server_manager.close_all()
     if hasattr(app.state, "scheduler_manager"):
         await app.state.scheduler_manager.stop()
+    if hasattr(app.state, "internal_polling"):
+        await app.state.internal_polling.stop()
+
+    logger.info("应用已完全关闭")
 
 app = FastAPI(
     title="Misaka Danmaku External Control API",
     description="用于外部自动化和集成的API。所有端点都需要通过 `?api_key=` 进行鉴权。",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/api/control/docs",  # 为外部控制API设置专用的文档路径
+    # 禁用默认的 docs_url，我们将使用自定义的本地化版本
+    docs_url=None,
     redoc_url=None         # 禁用ReDoc
 )
+
+# --- favicon.ico 路由 ---
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """提供网站图标"""
+    return FileResponse("web/dist/images/favicon.ico", media_type="image/x-icon")
+
+# --- 新增：自定义本地化的 Swagger UI 文档路由 ---
+@app.get("/api/control/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    """提供一个使用本地静态资源的 Swagger UI 页面。"""
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - API Docs",
+        swagger_js_url="/static/swagger-ui/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger-ui/swagger-ui.css",
+        swagger_favicon_url="/static/swagger-ui/favicon-32x32.png"
+    )
 
 # 新增：配置CORS，允许前端开发服务器访问API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        f"http://{settings.client.host}:{settings.client.port}",  # 前端开发服务器
-        "http://localhost:5173",  # 默认Vite开发端口
-        "http://127.0.0.1:5173",
-    ],
+    # 允许所有来源。对于生产环境，建议替换为您的前端域名列表。
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -176,8 +398,23 @@ async def log_not_found_requests(request: Request, call_next):
     """
     response = await call_next(request)
     if response.status_code == 404:
-        # 如果是 API 路径未找到，返回 403
+        # 如果是 API 路径未找到，返回 403，同时记录原始响应内容
         if request.url.path.startswith("/api/"):
+            original_body_text = None
+            try:
+                body_bytes = getattr(response, "body", b"")
+                if isinstance(body_bytes, (bytes, bytearray)) and body_bytes:
+                    try:
+                        original_json = json.loads(body_bytes)
+                        original_body_text = json.dumps(original_json, ensure_ascii=False)
+                    except Exception:
+                        original_body_text = body_bytes.decode("utf-8", "ignore")
+            except Exception as e:
+                logger.debug(f"读取原始404响应body失败: {e}")
+
+            if original_body_text:
+                logger.warning("API路径未找到原始响应内容: %s", original_body_text)
+
             logger.warning(
                 f"API路径未找到 (返回403): {request.method} {request.url.path} from {request.client.host}"
             )
@@ -185,7 +422,7 @@ async def log_not_found_requests(request: Request, call_next):
                 status_code=status.HTTP_403_FORBIDDEN,
                 content={"detail": "Forbidden"}
             )
-        
+
         # 对于非 API 路径的 404 (例如，如果静态文件服务被错误配置)，记录详细信息
         scope = request.scope
         serializable_scope = {
@@ -223,31 +460,44 @@ async def cleanup_task(app: FastAPI):
         except Exception as e:
             logging.getLogger(__name__).error(f"缓存清理任务出错: {e}")
 
-# 包含所有非 dandanplay 的 API 路由
-app.include_router(api_router, prefix="/api")
+
+
+
+
+# 新增：显式地挂载外部控制API路由，以确保其优先级
+app.include_router(control_router, prefix="/api/control", tags=["External Control API"])
 
 app.include_router(dandan_router, prefix="/api/v1", tags=["DanDanPlay Compatible"], include_in_schema=False)
 
-# --- 前端服务 (生产环境) ---
-# 在生产环境中，我们需要挂载 Vite 构建后的静态资源目录
-# 并且需要一个“捕获所有”的路由来始终提供 index.html，以支持前端路由。
-if settings.environment == "development":
-    # 开发环境：所有非API请求都重定向到Vite开发服务器
-    @app.get("/{full_path:path}", include_in_schema=False)
-    async def serve_react_app_dev(request: Request, full_path: str):
-        base_url = f"http://{settings.client.host}:{settings.client.port}"
-        return RedirectResponse(url=f"{base_url}/{full_path}" if full_path else base_url)
-else:
-    # 生产环境：显式挂载静态资源目录
-    app.mount("/assets", StaticFiles(directory="web/dist/assets"), name="assets")
-    # 修正：挂载前端的静态图片 (如 logo)，使其指向正确的 'web/dist/images' 目录
-    app.mount("/images", StaticFiles(directory="web/dist/images"), name="images")
-    # 挂载用户缓存的图片 (如海报)
-    app.mount("/data/images", StaticFiles(directory="config/image"), name="cached_images")
-    # 然后，为所有其他路径提供 index.html 以支持前端路由
-    @app.get("/{full_path:path}", include_in_schema=False)
-    async def serve_spa(request: Request, full_path: str):
-        return FileResponse("web/dist/index.html")
+# 包含所有非 dandanplay 的 API 路由
+app.include_router(api_router, prefix="/api")
+
+# --- 新增：挂载 Swagger UI 的静态文件目录 ---
+def _is_docker_environment():
+    """检测是否在Docker容器中运行"""
+    import os
+    # 方法1: 检查 /.dockerenv 文件（Docker标准做法）
+    if Path("/.dockerenv").exists():
+        return True
+    # 方法2: 检查环境变量
+    if os.getenv("DOCKER_CONTAINER") == "true" or os.getenv("IN_DOCKER") == "true":
+        return True
+    # 方法3: 检查当前工作目录是否为 /app
+    if Path.cwd() == Path("/app"):
+        return True
+    return False
+
+def _get_static_dir():
+    """获取静态文件目录，根据运行环境自动调整"""
+    if _is_docker_environment():
+        # 容器环境
+        return Path("/app/static/swagger-ui")
+    else:
+        # 源码运行环境
+        return Path("static/swagger-ui")
+
+STATIC_DIR = _get_static_dir()
+app.mount("/static/swagger-ui", StaticFiles(directory=STATIC_DIR), name="swagger-ui-static")
 
 # 添加一个运行入口，以便直接从配置启动
 # 这样就可以通过 `python -m src.main` 来运行，并自动使用 config.yml 中的端口和主机

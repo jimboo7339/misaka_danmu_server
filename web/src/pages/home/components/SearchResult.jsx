@@ -11,8 +11,6 @@ import {
   Card,
   Col,
   List,
-  message,
-  Checkbox,
   Row,
   Tag,
   Input,
@@ -21,11 +19,28 @@ import {
   Form,
   Empty,
   InputNumber,
+  Dropdown,
+  Space,
+  Checkbox,
+  Popover,
+  Select,
 } from 'antd'
 import { useAtom } from 'jotai'
-import { lastSearchResultAtom, searchLoadingAtom } from '../../../../store'
-import { CheckOutlined, CloseCircleOutlined } from '@ant-design/icons'
-import { DANDAN_TYPE_DESC_MAPPING, DANDAN_TYPE_MAPPING } from '../../../configs'
+import {
+  isMobileAtom,
+  lastSearchResultAtom,
+  searchLoadingAtom,
+} from '../../../../store'
+import {
+  CloseCircleOutlined,
+  CalendarOutlined,
+  CloudServerOutlined,
+  LinkOutlined,
+  ReloadOutlined,
+  SearchOutlined,
+  ClearOutlined,
+} from '@ant-design/icons'
+import { DANDAN_TYPE_MAPPING } from '../../../configs'
 import { useWatch } from 'antd/es/form/Form'
 
 import { MyIcon } from '@/components/MyIcon'
@@ -44,6 +59,8 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
+import { useModal } from '../../../ModalContext'
+import { useMessage } from '../../../MessageContext'
 
 const IMPORT_MODE = [
   {
@@ -64,10 +81,15 @@ export const SearchResult = () => {
   const [searchTmdbLoading, setSearchTmdbLoading] = useState(false)
   const [tmdbOpen, setTmdbOpen] = useState(false)
 
+  const [isMobile] = useAtom(isMobileAtom)
+
   const [searchLoading] = useAtom(searchLoadingAtom)
-  const [lastSearchResultData] = useAtom(lastSearchResultAtom)
+  const [lastSearchResultData, setLastSearchResultData] = useAtom(lastSearchResultAtom)
 
   const [selectList, setSelectList] = useState([])
+
+  const modalApi = useModal()
+  const messageApi = useMessage()
 
   /** 编辑导入相关 */
   const [editImportOpen, setEditImportOpen] = useState(false)
@@ -78,6 +100,13 @@ export const SearchResult = () => {
   const [activeItem, setActiveItem] = useState(null)
   const dragOverlayRef = useRef(null)
   const [editConfirmLoading, setEditConfirmLoading] = useState(false)
+  const [range, setRange] = useState([1, 1])
+  const [episodePageSize, setEpisodePageSize] = useState(10)
+  const [episodeOrder, setEpisodeOrder] = useState('asc') // 新增：排序状态
+
+  // 补充源状态管理
+  const [supplementMap, setSupplementMap] = useState({})
+  // { 'bilibili_ss12345': { provider: '360', mediaId: 'xxx', title: 'xxx', enabled: true } }
 
   const sensors = useSensors(
     useSensor(MouseSensor, {
@@ -93,7 +122,9 @@ export const SearchResult = () => {
     })
   )
 
-  const searchSeason = lastSearchResultData?.season
+  const searchSeason = lastSearchResultData?.search_season
+  const searchEpisode = lastSearchResultData?.search_episode
+  const supplementalResults = lastSearchResultData?.supplemental_results || []
 
   const [loading, setLoading] = useState(false)
 
@@ -104,10 +135,9 @@ export const SearchResult = () => {
   const [importMode, setImportMode] = useState(IMPORT_MODE[0].key)
 
   /** 筛选条件 */
-  const [checkedList, setCheckedList] = useState([
-    DANDAN_TYPE_MAPPING.movie,
-    DANDAN_TYPE_MAPPING.tvseries,
-  ])
+  const [typeFilter, setTypeFilter] = useState('all')
+  const [yearFilter, setYearFilter] = useState('all')
+  const [providerFilter, setProviderFilter] = useState('all')
 
   const [keyword, setKeyword] = useState('')
 
@@ -115,6 +145,17 @@ export const SearchResult = () => {
   const [renderData, setRenderData] = useState(
     lastSearchResultData.results || []
   )
+
+  useEffect(() => {
+    setSelectList([])
+  }, [renderData])
+
+  useEffect(() => {
+    if (searchLoading) {
+      setYearFilter('all')
+      setProviderFilter('all')
+    }
+  }, [searchLoading])
 
   const importModeText = useMemo(() => {
     const uniqueTitles = new Set(selectList.map(item => item.title))
@@ -135,46 +176,62 @@ export const SearchResult = () => {
   }, [selectList])
 
   useEffect(() => {
-    const list = lastSearchResultData.results
-      ?.filter(it => it.title.includes(keyword))
-      ?.filter(it => checkedList.includes(it.type))
-    console.log(
-      keyword,
-      checkedList,
-      lastSearchResultData.results,
-      list,
-      'list'
-    )
+    const list =
+      lastSearchResultData.results
+        ?.filter(it => it.title.includes(keyword))
+        ?.filter(it => typeFilter === 'all' || it.type === typeFilter)
+        ?.filter(it => yearFilter === 'all' || it.year === yearFilter)
+        ?.filter(
+          it => providerFilter === 'all' || it.provider === providerFilter
+        ) || []
     setRenderData(list)
-  }, [keyword, checkedList, lastSearchResultData])
+  }, [keyword, typeFilter, lastSearchResultData, yearFilter, providerFilter])
 
-  const onTypeChange = values => {
-    console.log(values, 'values')
-    setCheckedList(values)
-  }
+  const { years, providers } = useMemo(() => {
+    if (!lastSearchResultData.results?.length)
+      return { years: [], providers: [] }
+    const yearSet = new Set()
+    const providerSet = new Set()
+    lastSearchResultData.results.forEach(item => {
+      if (item.year) yearSet.add(item.year)
+      if (item.provider) providerSet.add(item.provider)
+    })
+    return {
+      years: Array.from(yearSet).sort((a, b) => b - a),
+      providers: Array.from(providerSet).sort(),
+    }
+  }, [lastSearchResultData.results])
 
   const handleImportDanmu = async item => {
     try {
       if (loading) return
       setLoading(true)
-      const res = await importDanmu(
-        JSON.stringify({
-          provider: item.provider,
-          mediaId: item.mediaId,
-          animeTitle: item.title,
-          type: item.type,
-          // 关键修正：如果用户搜索时指定了季度，则优先使用该季度
-          // 否则，使用从单个结果中解析出的季度
-          season: searchSeason !== null ? searchSeason : item.season,
-          year: item.year, // 新增年份
-          imageUrl: item.imageUrl,
-          doubanId: item.doubanId,
-          currentEpisodeIndex: item.currentEpisodeIndex,
-        })
-      )
-      message.success(res.data.message || '导入成功')
+
+      // 检查是否有补充源 - 查找所有以主源key开头的补充源
+      const mainKey = `${item.provider}_${item.mediaId}`
+      const supplement = Object.entries(supplementMap).find(([key, value]) =>
+        key.startsWith(mainKey + '_') && value?.enabled
+      )?.[1]
+
+      const res = await importDanmu({
+        provider: item.provider,
+        mediaId: item.mediaId,
+        animeTitle: item.title,
+        type: item.type,
+        // 关键修正：如果用户搜索时指定了季度，则优先使用该季度
+        // 否则，使用从单个结果中解析出的季度
+        season: searchSeason ?? item.season,
+        year: item.year, // 新增年份
+        imageUrl: item.imageUrl,
+        doubanId: item.doubanId,
+        currentEpisodeIndex: item.currentEpisodeIndex,
+        // 新增: 补充源信息
+        supplementProvider: supplement?.enabled ? supplement.provider : undefined,
+        supplementMediaId: supplement?.enabled ? supplement.mediaId : undefined,
+      })
+      messageApi.success(res.data.message || '导入成功')
     } catch (error) {
-      message.error(`提交导入任务失败: ${error.detail || error}`)
+      messageApi.error(`提交导入任务失败: ${error.detail || error}`)
     } finally {
       setLoading(false)
     }
@@ -201,9 +258,9 @@ export const SearchResult = () => {
           episodes: editEpisodeList ?? [],
         })
       )
-      message.success(res.data?.message || '编辑导入任务已提交。')
+      messageApi.success(res.data?.message || '编辑导入任务已提交。')
     } catch (error) {
-      message.error(`提交导入任务失败: ${error.message}`)
+      messageApi.error(`提交导入任务失败: ${error.message}`)
     } finally {
       setEditConfirmLoading(false)
       setEditImportOpen(false)
@@ -217,14 +274,14 @@ export const SearchResult = () => {
     let tmdbparams = {}
     if (importMode === 'merge') {
       if (!title) {
-        message.error('最终导入名称不能为空。')
+        messageApi.error('最终导入名称不能为空。')
         return
       }
       tmdbparams = {
         tmdbId: `${tmdbid}`,
       }
     }
-    Modal.confirm({
+    modalApi.confirm({
       title: '批量导入',
       zIndex: 1002,
       content: (
@@ -238,7 +295,7 @@ export const SearchResult = () => {
       onOk: async () => {
         try {
           setConfirmLoading(true)
-          await Promise.all(
+          const results = await Promise.allSettled(
             selectList.map(item => {
               console.log(item, '1')
               return importDanmu(
@@ -257,11 +314,26 @@ export const SearchResult = () => {
               )
             })
           )
-          message.success('批量导入任务已提交，请在任务管理器中查看进度。')
+
+          // 统计成功和失败的任务
+          const successCount = results.filter(r => r.status === 'fulfilled').length
+          const failedCount = results.filter(r => r.status === 'rejected').length
+
+          if (successCount > 0) {
+            if (failedCount > 0) {
+              messageApi.warning(`已提交 ${successCount} 个任务，${failedCount} 个任务提交失败，请在任务管理器中查看进度。`)
+            } else {
+              messageApi.success('批量导入任务已提交，请在任务管理器中查看进度。')
+            }
+          } else {
+            messageApi.error('所有任务提交失败')
+          }
+
           setSelectList([])
           setConfirmLoading(false)
           setBatchOpen(false)
         } catch (err) {
+          messageApi.error('批量导入失败')
         } finally {
           setConfirmLoading(false)
           setBatchOpen(false)
@@ -285,10 +357,10 @@ export const SearchResult = () => {
         setTmdbResult(res?.data || [])
         setTmdbOpen(true)
       } else {
-        message.error('没有找到相关内容')
+        messageApi.error('没有找到相关内容')
       }
     } catch (error) {
-      message.error('TMDB搜索失败')
+      messageApi.error('TMDB搜索失败')
     } finally {
       setSearchTmdbLoading(false)
     }
@@ -330,6 +402,61 @@ export const SearchResult = () => {
     })
 
     setActiveItem(null)
+  }
+
+  // 类型筛选菜单
+  const typeMenu = {
+    items: [
+      {
+        key: 'all',
+        label: (
+          <>
+            <MyIcon icon="tvlibrary" size={16} className="mr-2" />
+            所有类型
+          </>
+        ),
+      },
+      {
+        key: DANDAN_TYPE_MAPPING.movie,
+        label: (
+          <>
+            <MyIcon icon="movie" size={16} className="mr-2" />
+            电影/剧场版
+          </>
+        ),
+      },
+      {
+        key: DANDAN_TYPE_MAPPING.tvseries,
+        label: (
+          <>
+            <MyIcon icon="tv" size={16} className="mr-2" />
+            电视节目
+          </>
+        ),
+      },
+    ],
+    onClick: ({ key }) => setTypeFilter(key),
+  }
+
+  // 年份筛选菜单
+  const yearMenu = {
+    items: [
+      { key: 'all', label: '所有年份' },
+      ...years.map(year => ({ key: year, label: `${year}年` })),
+    ],
+    onClick: ({ key }) => setYearFilter(key === 'all' ? 'all' : Number(key)),
+  }
+
+  // 来源筛选菜单
+  const providerMenu = {
+    items: [
+      { key: 'all', label: '所有来源' },
+      ...providers.map(p => ({
+        key: p,
+        label: p.charAt(0).toUpperCase() + p.slice(1),
+      })),
+    ],
+    onClick: ({ key }) => setProviderFilter(key),
   }
 
   // 处理拖拽开始
@@ -419,75 +546,416 @@ export const SearchResult = () => {
     )
   }
 
-  return (
-    <div className="my-4">
-      <Card title="搜索结果" loading={searchLoading}>
-        <div>
-          <Row gutter={[12, 12]} className="mb-6">
-            <Col md={20} xs={24}>
-              <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-4">
-                <Button
-                  type="primary"
-                  className="w-32"
-                  onClick={() => {
-                    setSelectList(list =>
-                      list.length === renderData.length ? [] : renderData
-                    )
-                  }}
-                  disabled={!renderData.length}
-                >
-                  {selectList.length === renderData.length && renderData.length
-                    ? '取消全选'
-                    : '全选'}
-                </Button>
-                <Checkbox.Group
-                  options={[
-                    {
-                      label: '电影/剧场版',
-                      value: DANDAN_TYPE_MAPPING.movie,
-                    },
-                    {
-                      label: '电视节目',
-                      value: DANDAN_TYPE_MAPPING.tvseries,
-                    },
-                  ]}
-                  value={checkedList}
-                  onChange={onTypeChange}
-                />
-                <div className="w-40">
-                  <Input
-                    placeholder="在结果中过滤标题"
-                    onChange={e => setKeyword(e.target.value)}
-                  />
-                </div>
-              </div>
-            </Col>
-            <Col md={4} xs={24}>
-              <Button
-                block
-                type="primary"
-                onClick={() => {
-                  if (selectList.length === 0) {
-                    message.error('请选择要导入的媒体')
-                    return
-                  }
+  // 新增：切换排序的处理函数
+  const handleToggleOrder = () => {
+    const newOrder = episodeOrder === 'asc' ? 'desc' : 'asc'
+    setEpisodeOrder(newOrder)
 
-                  setBatchOpen(true)
+    setEditEpisodeList(list => {
+      const sortedList = [...list].sort((a, b) => {
+        if (newOrder === 'asc') {
+          return a.episodeIndex - b.episodeIndex
+        } else {
+          return b.episodeIndex - a.episodeIndex
+        }
+      })
+      return sortedList
+    })
+  }
+
+  // 补充源复选框处理
+  const handleSupplementToggle = (mainItem, supplement, checked, customKey = null) => {
+    // 使用自定义key或默认key
+    const key = customKey || `${mainItem.provider}_${mainItem.mediaId}`
+
+    if (checked) {
+      // 如果勾选了新的补充源,需要取消同一主源的其他补充源
+      const mainKey = `${mainItem.provider}_${mainItem.mediaId}`
+      const newMap = { ...supplementMap }
+
+      // 清除同一主源的其他补充源
+      Object.keys(newMap).forEach(k => {
+        if (k.startsWith(mainKey + '_') && k !== key) {
+          delete newMap[k]
+        }
+      })
+
+      // 设置新的补充源
+      newMap[key] = {
+        provider: supplement.provider,
+        mediaId: supplement.mediaId,
+        title: supplement.title,
+        enabled: true
+      }
+
+      setSupplementMap(newMap)
+    } else {
+      // 取消勾选
+      setSupplementMap(prev => {
+        const newMap = { ...prev }
+        delete newMap[key]
+        return newMap
+      })
+    }
+  }
+
+  // 补充搜索
+  const supplementDom = item => {
+    if (item.episodeCount === 0) {
+      const calculateSimilarity = (str1, str2) => {
+        if (!str1 || !str2) return 0
+        const s1 = str1.toLowerCase().trim()
+        const s2 = str2.toLowerCase().trim()
+        if (s1 === s2) return 100
+        if (s1.includes(s2) || s2.includes(s1)) return 85
+        // 简单的词汇匹配
+        const words1 = s1.split(/\s+/)
+        const words2 = s2.split(/\s+/)
+        const commonWords = words1.filter(word => words2.includes(word))
+        return (
+          (commonWords.length / Math.max(words1.length, words2.length)) * 100
+        )
+      }
+
+      // 查找所有匹配的补充源(相似度>80且支持分集URL且支持当前主源平台)
+      const matching_supplements = supplementalResults.filter(
+        sup => {
+          // 基本条件: 不是同一个provider, 标题相似度>80, 支持分集URL
+          if (sup.provider === item.provider) return false
+          if (calculateSimilarity(item.title, sup.title) <= 80) return false
+          if (sup.supportsEpisodeUrls !== true) return false
+
+          // 检查补充源是否支持当前主源的平台
+          const supportedProviders = sup.extra?.supported_providers || []
+          if (supportedProviders.length === 0) {
+            // 如果没有supported_providers信息,保持兼容性,允许显示
+            return true
+          }
+
+          // 只有当补充源支持当前主源平台时才显示
+          return supportedProviders.includes(item.provider)
+        }
+      )
+
+      if (matching_supplements.length > 0) {
+        const mainKey = `${item.provider}_${item.mediaId}`
+
+        // 查找当前选中的补充源(不管是否启用)
+        const selectedKey = Object.keys(supplementMap).find(k =>
+          k.startsWith(mainKey + '_')
+        )
+        // key格式: provider_mediaId_supplementProvider_supplementMediaId
+        // 提取 supplementProvider_supplementMediaId 作为 value
+        const selectedProvider = selectedKey ? selectedKey.substring(mainKey.length + 1) : undefined
+        const isEnabled = selectedKey ? (supplementMap[selectedKey]?.enabled || false) : false
+
+        return (
+          <div className="mt-2 p-2 bg-gray-100 dark:bg-gray-700 rounded-md flex items-center gap-2">
+            <span className="text-sm text-gray-500 dark:text-gray-400 shrink-0">
+              找到补充源:
+            </span>
+            <Select
+              placeholder="选择补充源"
+              value={selectedProvider}
+              onChange={value => {
+                // 如果选择了补充源
+                if (value) {
+                  // 使用唯一key来查找补充源
+                  const supplement = matching_supplements.find(s => `${s.provider}_${s.mediaId}` === value)
+                  if (supplement) {
+                    const key = `${item.provider}_${item.mediaId}_${supplement.provider}_${supplement.mediaId}`
+                    // 选择补充源时,不自动启用,需要用户勾选checkbox
+                    setSupplementMap(prev => {
+                      const newMap = { ...prev }
+                      // 清除同一主源的其他补充源
+                      Object.keys(newMap).forEach(k => {
+                        if (k.startsWith(mainKey + '_') && k !== key) {
+                          delete newMap[k]
+                        }
+                      })
+                      // 添加新选择的补充源(但不启用)
+                      newMap[key] = {
+                        provider: supplement.provider,
+                        mediaId: supplement.mediaId,
+                        title: supplement.title,
+                        enabled: false
+                      }
+                      return newMap
+                    })
+                  }
+                } else {
+                  // 如果清空选择,删除所有该主源的补充源
+                  setSupplementMap(prev => {
+                    const newMap = { ...prev }
+                    Object.keys(newMap).forEach(k => {
+                      if (k.startsWith(mainKey + '_')) {
+                        delete newMap[k]
+                      }
+                    })
+                    return newMap
+                  })
+                }
+              }}
+              allowClear
+              style={{ minWidth: 200 }}
+              options={matching_supplements.map(supplement => ({
+                label: `${supplement.provider} - ${supplement.title}`,
+                value: `${supplement.provider}_${supplement.mediaId}`
+              }))}
+            />
+            {selectedProvider && (
+              <Checkbox
+                checked={isEnabled}
+                onChange={e => {
+                  e.stopPropagation()
+                  // 使用唯一key来查找补充源
+                  const supplement = matching_supplements.find(s => `${s.provider}_${s.mediaId}` === selectedProvider)
+                  if (supplement) {
+                    const key = `${item.provider}_${item.mediaId}_${supplement.provider}_${supplement.mediaId}`
+                    handleSupplementToggle(item, supplement, e.target.checked, key)
+                  }
                 }}
               >
-                批量导入
-              </Button>
-            </Col>
-          </Row>
+                使用补充源分集列表
+              </Checkbox>
+            )}
+          </div>
+        )
+      }
+      return null
+    }
+    return null
+  }
+
+  return (
+    <>
+      {lastSearchResultData && (
+        <div className="border-t border-base-border mt-6 pt-6">
+          <div className="text-lg font-semibold mb-4">搜索结果</div>
+          <div>
+            <div className="mb-6">
+              {isMobile ? (
+                /* 移动端：两行布局 */
+                <div className="flex flex-col gap-2">
+                  {/* 第一行：4个筛选按钮 */}
+                  <div className="grid grid-cols-4 gap-2">
+                    <Button
+                      type="primary"
+                      onClick={() => {
+                        setSelectList(list =>
+                          list.length === renderData.length ? [] : renderData
+                        )
+                      }}
+                      disabled={!renderData.length}
+                    >
+                      {selectList.length === renderData.length && renderData.length
+                        ? '取消全选'
+                        : '全选'}
+                    </Button>
+                    <Dropdown menu={typeMenu}>
+                      <Button className="w-full">
+                        {typeFilter === 'all' ? (
+                          <>
+                            <MyIcon icon="tvlibrary" size={16} className="mr-1" />
+                            类型
+                          </>
+                        ) : typeFilter === DANDAN_TYPE_MAPPING.movie ? (
+                          <>
+                            <MyIcon icon="movie" size={16} className="mr-1" />
+                            电影
+                          </>
+                        ) : (
+                          <>
+                            <MyIcon icon="tv" size={16} className="mr-1" />
+                            TV
+                          </>
+                        )}
+                      </Button>
+                    </Dropdown>
+                    <Dropdown menu={yearMenu} disabled={!years.length}>
+                      <Button icon={<CalendarOutlined />} className="w-full">
+                        {yearFilter === 'all' ? '年份' : `${yearFilter}年`}
+                      </Button>
+                    </Dropdown>
+                    <Dropdown menu={providerMenu} disabled={!providers.length}>
+                      <Button icon={<CloudServerOutlined />} className="w-full">
+                        {providerFilter === 'all'
+                          ? '来源'
+                          : providerFilter.charAt(0).toUpperCase() +
+                            providerFilter.slice(1)}
+                      </Button>
+                    </Dropdown>
+                  </div>
+                  {/* 第二行：3个操作按钮均等分布 */}
+                  <div className="grid grid-cols-3 gap-2">
+                    <Popover
+                      content={
+                        <div style={{ width: 250 }}>
+                          <Input
+                            placeholder="输入标题关键词过滤"
+                            allowClear
+                            value={keyword}
+                            onChange={e => setKeyword(e.target.value)}
+                            autoFocus
+                          />
+                        </div>
+                      }
+                      title="过滤结果"
+                      trigger="click"
+                      placement="bottom"
+                    >
+                      <Button icon={<SearchOutlined />} className="w-full">
+                        {keyword ? `过滤: ${keyword.length > 5 ? keyword.slice(0, 5) + '...' : keyword}` : '过滤'}
+                      </Button>
+                    </Popover>
+                    <Button
+                      icon={<ClearOutlined />}
+                      className="w-full"
+                      disabled={!renderData.length}
+                      onClick={() => {
+                        setLastSearchResultData({
+                          results: [],
+                          searchSeason: null,
+                          keyword: '',
+                        })
+                        setSelectList([])
+                        setKeyword('')
+                        setYearFilter('all')
+                        setProviderFilter('all')
+                        setTypeFilter('all')
+                      }}
+                    >
+                      清除
+                    </Button>
+                    <Button
+                      className="w-full"
+                      type="primary"
+                      onClick={() => {
+                        if (selectList.length === 0) {
+                          messageApi.error('请选择要导入的媒体')
+                          return
+                        }
+                        setBatchOpen(true)
+                      }}
+                      disabled={!renderData.length}
+                    >
+                      批量导入
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                /* 桌面端：单行flex布局 */
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Button
+                    type="primary"
+                    onClick={() => {
+                      setSelectList(list =>
+                        list.length === renderData.length ? [] : renderData
+                      )
+                    }}
+                    disabled={!renderData.length}
+                  >
+                    {selectList.length === renderData.length && renderData.length
+                      ? '取消全选'
+                      : '全选'}
+                  </Button>
+                  <Dropdown menu={typeMenu}>
+                    <Button>
+                      {typeFilter === 'all' ? (
+                        <>
+                          <MyIcon icon="tvlibrary" size={16} className="mr-1" />
+                          按类型
+                        </>
+                      ) : typeFilter === DANDAN_TYPE_MAPPING.movie ? (
+                        <>
+                          <MyIcon icon="movie" size={16} className="mr-1" />
+                          电影/剧场版
+                        </>
+                      ) : (
+                        <>
+                          <MyIcon icon="tv" size={16} className="mr-1" />
+                          电视节目
+                        </>
+                      )}
+                    </Button>
+                  </Dropdown>
+                  <Dropdown menu={yearMenu} disabled={!years.length}>
+                    <Button icon={<CalendarOutlined />}>
+                      {yearFilter === 'all' ? '按年份' : `${yearFilter}年`}
+                    </Button>
+                  </Dropdown>
+                  <Dropdown menu={providerMenu} disabled={!providers.length}>
+                    <Button icon={<CloudServerOutlined />}>
+                      {providerFilter === 'all'
+                        ? '按来源'
+                        : providerFilter.charAt(0).toUpperCase() +
+                          providerFilter.slice(1)}
+                    </Button>
+                  </Dropdown>
+                  <Popover
+                    content={
+                      <div style={{ width: 250 }}>
+                        <Input
+                          placeholder="输入标题关键词过滤"
+                          allowClear
+                          value={keyword}
+                          onChange={e => setKeyword(e.target.value)}
+                          autoFocus
+                        />
+                      </div>
+                    }
+                    title="过滤结果"
+                    trigger="click"
+                    placement="bottomRight"
+                  >
+                    <Button icon={<SearchOutlined />}>
+                      {keyword ? `过滤: ${keyword.length > 5 ? keyword.slice(0, 5) + '...' : keyword}` : '过滤'}
+                    </Button>
+                  </Popover>
+                  <Button
+                    icon={<ClearOutlined />}
+                    className="ml-auto"
+                    disabled={!renderData.length}
+                    onClick={() => {
+                      setLastSearchResultData({
+                        results: [],
+                        searchSeason: null,
+                        keyword: '',
+                      })
+                      setSelectList([])
+                      setKeyword('')
+                      setYearFilter('all')
+                      setProviderFilter('all')
+                      setTypeFilter('all')
+                    }}
+                  >
+                    清除结果
+                  </Button>
+                  <Button
+                    type="primary"
+                    onClick={() => {
+                      if (selectList.length === 0) {
+                        messageApi.error('请选择要导入的媒体')
+                        return
+                      }
+                      setBatchOpen(true)
+                    }}
+                    disabled={!renderData.length}
+                  >
+                    批量导入
+                  </Button>
+                </div>
+              )}
+            </div>
           {!!renderData?.length ? (
             <List
               itemLayout="vertical"
               size="large"
               dataSource={renderData}
-              renderItem={(item, index) => {
+              renderItem={item => {
                 const isActive = selectList.includes(item)
                 return (
-                  <List.Item key={index}>
+                  <List.Item key={`${item.mediaId}-${item.provider}`}>
                     <Row gutter={[12, 12]}>
                       <Col md={16} xs={24}>
                         <div
@@ -500,29 +968,63 @@ export const SearchResult = () => {
                             })
                           }
                         >
-                          <div className="shrink-0 mr-3 w-6 h-6 border-2 border-base-text rounded-full flex items-center justify-center">
-                            {isActive && (
-                              <CheckOutlined className="font-base font-bold" />
-                            )}
-                          </div>
-                          <img width={60} alt="logo" src={item.imageUrl} />
+                          <Checkbox checked={isActive} />
+                          <img
+                            width={60}
+                            alt="logo"
+                            src={item.imageUrl}
+                            className="ml-3 aspect-[3/4]"
+                          />
                           <div className="ml-4">
                             <div className="text-xl font-bold mb-3">
                               {item.title}
+                              {item.type === 'movie' ? (
+                                <MyIcon
+                                  icon="movie"
+                                  size={20}
+                                  className="ml-2"
+                                />
+                              ) : (
+                                <MyIcon icon="tv" size={20} className="ml-2" />
+                              )}
+                              {item.url && (
+                                <a
+                                  href={item.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="ml-2 text-blue-500 hover:text-blue-700 inline-flex items-center"
+                                  title="在平台打开"
+                                >
+                                  <LinkOutlined style={{ fontSize: '18px' }} />
+                                </a>
+                              )}
                             </div>
                             <div className="flex items-center flex-wrap gap-2">
-                              <Tag color="magenta">源：{item.provider}</Tag>
-                              <Tag color="red">
-                                类型：{DANDAN_TYPE_DESC_MAPPING[item.type]}
+                              <Tag color="magenta">
+                                源：{item.provider ?? '未知'}
                               </Tag>
-                              <Tag color="volcano">年份：{item.year}</Tag>
-                              <Tag color="orange">季度：{item.season}</Tag>
+                              <Tag color="volcano">
+                                年份：{item.year ?? '未知'}
+                              </Tag>
+                              <Tag color="orange">
+                                季度：{item.season ?? '未知'}
+                              </Tag>
                               <Tag color="gold">
                                 总集数：{item.episodeCount ?? 0}
                               </Tag>
+                              {searchEpisode && (
+                                <Tag color="cyan">
+                                  单集获取：{searchEpisode}
+                                </Tag>
+                              )}
                             </div>
+                            {!isMobile && <>{supplementDom(item)}</>}
                           </div>
                         </div>
+                        {isMobile && (
+                          <div className="mt-3">{supplementDom(item)}</div>
+                        )}
                       </Col>
                       <Col md={4} xs={12}>
                         <Button
@@ -534,14 +1036,33 @@ export const SearchResult = () => {
                             try {
                               if (editLoading) return
                               setEditLoading(true)
-                              const res = await getEditEpisodes({
+
+                              // 检查是否有补充源 - 查找所有以主源key开头的补充源
+                              const mainKey = `${item.provider}_${item.mediaId}`
+                              const supplement = Object.entries(supplementMap).find(([key, value]) =>
+                                key.startsWith(mainKey + '_') && value?.enabled
+                              )?.[1]
+
+                              // 构建请求参数
+                              const params = {
                                 provider: item.provider,
                                 media_id: item.mediaId,
                                 media_type: item.type,
-                              })
+                              }
+
+                              // 如果启用了补充源,添加补充源参数
+                              if (supplement?.enabled) {
+                                params.supplement_provider = supplement.provider
+                                params.supplement_media_id = supplement.mediaId
+                              }
+
+                              const res = await getEditEpisodes(params)
                               setEditEpisodeList(res.data)
                               setEditImportOpen(true)
                               setEditItem(item)
+                              // 修正：设置区间的结束值为总集数，如果总集数为0或不存在则为1
+                              const endValue = item.episodeCount > 0 ? item.episodeCount : 1
+                              setRange([1, endValue])
                             } catch (error) {
                             } finally {
                               setEditLoading(false)
@@ -561,7 +1082,7 @@ export const SearchResult = () => {
                             handleImportDanmu(item)
                           }}
                         >
-                          导入弹幕
+                          直接导入
                         </Button>
                       </Col>
                     </Row>
@@ -573,7 +1094,8 @@ export const SearchResult = () => {
             <Empty description="暂无搜索结果" />
           )}
         </div>
-      </Card>
+        </div>
+      )}
       <Modal
         title="批量导入确认"
         open={batchOpen}
@@ -593,15 +1115,19 @@ export const SearchResult = () => {
                   key={index}
                   className="my-3 p-2 rounded-xl border-gray-300/45 border"
                 >
-                  <div className="text-xl font-bold mb-2">{item.title}</div>
+                  <div className="text-xl font-bold mb-2">
+                    {item.title}
+                    {item.type === 'movie' ? (
+                      <MyIcon icon="movie" size={20} className="ml-2" />
+                    ) : (
+                      <MyIcon icon="tv" size={20} className="ml-2" />
+                    )}
+                  </div>
                   <div className="flex items-center flex-wrap gap-2">
-                    <Tag color="magenta">源：{item.provider}</Tag>
-                    <Tag color="red">
-                      类型：{DANDAN_TYPE_DESC_MAPPING[item.type]}
-                    </Tag>
-                    <Tag color="volcano">年份：{item.year}</Tag>
-                    <Tag color="orange">季度：{item.season}</Tag>
-                    <Tag color="gold">总集数：{item.episodeCount}</Tag>
+                    <Tag color="magenta">源：{item.provider ?? '未知'}</Tag>
+                    <Tag color="volcano">年份：{item.year ?? '未知'}</Tag>
+                    <Tag color="orange">季度：{item.season ?? '未知'}</Tag>
+                    <Tag color="gold">总集数：{item.episodeCount ?? 0}</Tag>
                   </div>
                 </div>
               )
@@ -629,7 +1155,7 @@ export const SearchResult = () => {
                 <Input.Search
                   placeholder="请输入最终导入名称"
                   allowClear
-                  enterButton="Search"
+                  enterButton="搜索"
                   loading={searchTmdbLoading}
                   onSearch={onTmdbSearch}
                 />
@@ -653,6 +1179,8 @@ export const SearchResult = () => {
           dataSource={tmdbList}
           pagination={{
             pageSize: 4,
+            showSizeChanger: false,
+            hideOnSinglePage: true,
           }}
           renderItem={(item, index) => {
             return (
@@ -661,8 +1189,15 @@ export const SearchResult = () => {
                   <div className="flex items-center justify-start">
                     <img width={60} alt="logo" src={item.imageUrl} />
                     <div className="ml-4">
-                      <div className="text-xl font-bold mb-3">{item.name}</div>
+                      <div className="text-xl font-bold mb-3">
+                        {item.title || item.name}
+                      </div>
                       <div>ID: {item.id}</div>
+                      {!!item.details && (
+                        <div className="text-sm mt-2 line-clamp-4">
+                          {item.details}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div>
@@ -687,99 +1222,262 @@ export const SearchResult = () => {
       <Modal
         title={`编辑导入: ${editItem.title}`}
         open={editImportOpen}
-        onOk={() => {
-          handleImportEdit()
-        }}
-        confirmLoading={editConfirmLoading}
-        cancelText="取消"
-        okText="确认导入"
         onCancel={() => setEditImportOpen(false)}
-      >
-        <div className="flex item-wrap md:flex-nowrap justify-between items-center gap-3 my-6">
-          <div className="shrink-0">作品标题:</div>
-          <div className="w-full">
-            <Input
-              value={editAnimeTitle || editItem.title}
-              placeholder="请输入作品标题"
-              onChange={e => {
-                setEditAnimeTitle(e.target.value)
-              }}
-              style={{ width: '100%' }}
-            />
-          </div>
-          <div>
-            <Button
-              type="default"
-              onClick={async () => {
-                try {
-                  const res = await getInLibraryEpisodes({
-                    title: editAnimeTitle || editItem.title,
-                    season: editItem.season ?? 1,
-                  })
-                  if (!res.data?.length) {
-                    message.error(
-                      `在弹幕库中未找到作品 "${editAnimeTitle || editItem.title}" 或该作品没有任何分集。`
-                    )
-                    return
-                  }
-                  setEditEpisodeList(list => {
-                    return list.filter(
-                      it => !(res.data ?? []).includes(it.episodeIndex)
-                    )
-                  })
-                  const removedCount = editEpisodeList.reduce((total, item) => {
-                    return (
-                      total +
-                      (res.data ?? []).includes(item.episodeIndex ? 1 : 0)
-                    )
-                  }, 0)
-
-                  message.success(
-                    `重整完成！根据库内记录，移除了 ${removedCount} 个已存在的分集。`
-                  )
-                } catch (error) {
-                  message.error(`查询已存在分集失败: ${error.message}`)
-                }
-              }}
-            >
-              重整分集导入
-            </Button>
-          </div>
-        </div>
-        <div>
-          <DndContext
-            sensors={sensors}
-            collisionDetection={closestCorners}
-            onDragStart={handleDragStart}
-            onDragEnd={handleDragEnd}
+        footer={[
+          <Button
+            key="order"
+            type={episodeOrder === 'asc' ? 'default' : 'primary'}
+            onClick={handleToggleOrder}
+            style={{ float: 'left' }}
           >
-            <SortableContext
-              items={editEpisodeList.map(item => item.episodeId)}
-              strategy={verticalListSortingStrategy}
-            >
-              <List
-                itemLayout="vertical"
-                size="large"
-                dataSource={editEpisodeList}
-                renderItem={(item, index) => (
-                  <SortableItem
-                    key={item.episodeId}
-                    item={item}
-                    index={index}
-                    handleDelete={() => handleDelete(item)}
-                    handleEditTitle={value => handleEditTitle(item, value)}
-                    handleEditIndex={value => handleEditIndex(item, value)}
-                  />
-                )}
-              />
-            </SortableContext>
+            {episodeOrder === 'asc' ? '正序' : '倒序'}
+          </Button>,
+          <Button key="cancel" onClick={() => setEditImportOpen(false)}>
+            取消
+          </Button>,
+          <Button
+            key="submit"
+            type="primary"
+            loading={editConfirmLoading}
+            onClick={() => {
+              handleImportEdit()
+            }}
+          >
+            确认导入
+          </Button>,
+        ]}
+      >
+        <div className={isMobile ? "max-h-[60vh]" : "max-h-[70vh] overflow-y-auto"}>
+          {isMobile ? (
+            <div className="space-y-4 my-6">
+              <div>
+                <div className="font-medium text-sm mb-2">作品标题</div>
+                <Input
+                  value={editAnimeTitle || editItem.title}
+                  placeholder="请输入作品标题"
+                  onChange={e => {
+                    setEditAnimeTitle(e.target.value)
+                  }}
+                />
+              </div>
+              <Button
+                type="primary"
+                icon={<ReloadOutlined />}
+                block
+                onClick={async () => {
+                  try {
+                    const res = await getInLibraryEpisodes({
+                      title: editAnimeTitle || editItem.title,
+                      season: editItem.season ?? 1,
+                    })
+                    if (!res.data?.length) {
+                      messageApi.error(
+                        `在弹幕库中未找到作品 "${editAnimeTitle || editItem.title}" 或该作品没有任何分集。`
+                      )
+                      return
+                    }
+                    setEditEpisodeList(list => {
+                      return list.filter(
+                        it => !(res.data ?? []).includes(it.episodeIndex)
+                      )
+                    })
+                    const removedCount = editEpisodeList.reduce((total, item) => {
+                      return (
+                        total +
+                        (res.data ?? []).includes(item.episodeIndex ? 1 : 0)
+                      )
+                    }, 0)
 
-            {/* 拖拽覆盖层 */}
-            <DragOverlay>{renderDragOverlay()}</DragOverlay>
-          </DndContext>
+                    messageApi.success(
+                      `重整完成！根据库内记录，移除了 ${removedCount} 个已存在的分集。`
+                    )
+                  } catch (error) {
+                    messageApi.error(`查询已存在分集失败: ${error.message}`)
+                  }
+                }}
+              >
+                重整分集导入
+              </Button>
+              
+              <div>
+                <div className="font-medium text-sm mb-2">集数区间</div>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="text-sm">从</span>
+                  <InputNumber
+                    className="flex-1"
+                    value={range[0]}
+                    onChange={value => setRange(r => [value, r[1]])}
+                    min={1}
+                    max={range[1]}
+                    step={1}
+                  />
+                  <span className="text-sm">到</span>
+                  <InputNumber
+                    className="flex-1"
+                    value={range[1]}
+                    onChange={value => setRange(r => [r[0], value])}
+                    min={range[0]}
+                    step={1}
+                  />
+                </div>
+                <Button
+                  type="primary"
+                  block
+                  onClick={() => {
+                    console.log(range)
+                    setEditEpisodeList(list => {
+                      return list.filter(
+                        it =>
+                          it.episodeIndex >= range[0] && it.episodeIndex <= range[1]
+                      )
+                    })
+                  }}
+                >
+                  确认区间
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-wrap md:flex-nowrap justify-between items-center gap-3 my-6">
+                <div className="shrink-0">作品标题:</div>
+                <div className="w-full">
+                  <Input
+                    value={editAnimeTitle || editItem.title}
+                    placeholder="请输入作品标题"
+                    onChange={e => {
+                      setEditAnimeTitle(e.target.value)
+                    }}
+                    style={{ width: '100%' }}
+                  />
+                </div>
+                <div>
+                  <Button
+                    type="default"
+                    onClick={async () => {
+                      try {
+                        const res = await getInLibraryEpisodes({
+                          title: editAnimeTitle || editItem.title,
+                          season: editItem.season ?? 1,
+                        })
+                        if (!res.data?.length) {
+                          messageApi.error(
+                            `在弹幕库中未找到作品 "${editAnimeTitle || editItem.title}" 或该作品没有任何分集。`
+                          )
+                          return
+                        }
+                        setEditEpisodeList(list => {
+                          return list.filter(
+                            it => !(res.data ?? []).includes(it.episodeIndex)
+                          )
+                        })
+                        const removedCount = editEpisodeList.reduce((total, item) => {
+                          return (
+                            total +
+                            (res.data ?? []).includes(item.episodeIndex ? 1 : 0)
+                          )
+                        }, 0)
+
+                        messageApi.success(
+                          `重整完成！根据库内记录，移除了 ${removedCount} 个已存在的分集。`
+                        )
+                      } catch (error) {
+                        messageApi.error(`查询已存在分集失败: ${error.message}`)
+                      }
+                    }}
+                  >
+                    重整分集导入
+                  </Button>
+                </div>
+              </div>
+              <div className="flex items-wrap md:flex-nowrap justify-between items-center gap-3 my-6">
+                <div className="shrink-0">集数区间:</div>
+                <div className="w-full flex items-center justify-between flex-wrap md:flex-nowrap gap-2">
+                  <div className="flex items-center justify-start gap-2">
+                    <span>从</span>
+                    <InputNumber
+                      value={range[0]}
+                      onChange={value => setRange(r => [value, r[1]])}
+                      min={1}
+                      max={range[1]}
+                      step={1}
+                      style={{
+                        width: '100%',
+                      }}
+                    />
+                    <span>到</span>
+                    <InputNumber
+                      value={range[1]}
+                      onChange={value => setRange(r => [r[0], value])}
+                      min={range[0]}
+                      step={1}
+                      style={{
+                        width: '100%',
+                      }}
+                    />
+                  </div>
+                  <Button
+                    type="primary"
+                    block
+                    onClick={() => {
+                      console.log(range)
+                      setEditEpisodeList(list => {
+                        return list.filter(
+                          it =>
+                            it.episodeIndex >= range[0] && it.episodeIndex <= range[1]
+                        )
+                      })
+                    }}
+                  >
+                    确认区间
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
+          <div>
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCorners}
+              onDragStart={handleDragStart}
+              onDragEnd={handleDragEnd}
+            >
+              <SortableContext
+                items={editEpisodeList.map(item => item.episodeId)}
+                strategy={verticalListSortingStrategy}
+              >
+                <List
+                  itemLayout="vertical"
+                  size="large"
+                  pagination={{
+                    pageSize: episodePageSize,
+                    onShowSizeChange: (_, size) => {
+                      setEpisodePageSize(size)
+                    },
+                    hideOnSinglePage: true,
+                    showLessItems: true,
+                  }}
+                  dataSource={editEpisodeList}
+                  renderItem={(item, index) => (
+                    <SortableItem
+                      key={item.episodeId}
+                      item={item}
+                      index={index}
+                      handleDelete={() => handleDelete(item)}
+                      handleEditTitle={value => handleEditTitle(item, value)}
+                      handleEditIndex={value => handleEditIndex(item, value)}
+                    />
+                  )}
+                />
+              </SortableContext>
+
+              {/* 拖拽覆盖层 */}
+              <DragOverlay>{renderDragOverlay()}</DragOverlay>
+            </DndContext>
+          </div>
         </div>
       </Modal>
-    </div>
+    </>
   )
 }
 
@@ -827,17 +1525,14 @@ const SortableItem = ({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    cursor: 'grab',
-    touchAction: 'none', // 关键：阻止浏览器默认触摸行为
-    userSelect: 'none', // 防止拖拽时选中文本
     ...(isDragging && { cursor: 'grabbing' }),
   }
 
   return (
-    <List.Item ref={setNodeRef} style={style} {...attributes}>
+    <List.Item ref={setNodeRef} style={style}>
       {/* 保留你原有的列表项渲染逻辑 */}
       <div className="w-full flex items-center justify-between">
-        <div {...listeners} style={{ cursor: 'grab' }}>
+        <div {...attributes} {...listeners} style={{ cursor: 'grab' }}>
           <MyIcon icon="drag" size={24} />
         </div>
         <div className="w-full flex items-center justify-start gap-3">

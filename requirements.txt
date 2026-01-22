@@ -6,7 +6,7 @@ SQLAlchemy[asyncio]
 greenlet
 apscheduler
 pydantic-settings
-httpx>=0.23.0
+httpx[socks]>=0.23.0
 # 使用固定的 passlib 和 bcrypt 版本以避免兼容性问题
 # passlib>=1.7.4 才与 bcrypt>=4.0 兼容
 passlib>=1.7.4
@@ -30,3 +30,16 @@ chardet
 opencc-python-reimplemented
 # 用于非对称加密签名验证
 cryptography
+# 用于SM2/SM3/SM4国密算法
+gmssl
+brotli
+requests
+# dandanplay scraper dependency
+aiohttp
+# migu
+wasmtime
+# AI匹配功能依赖
+openai>=1.0.0  # 支持OpenAI兼容接口: DeepSeek, OpenAI, SiliconFlow
+google-genai  # Google Gemini 官方 SDK (新版)
+# Docker 容器管理功能依赖
+docker>=6.0.0  # Docker SDK for Python

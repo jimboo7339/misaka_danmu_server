@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Search 模块模型
 class AnimeInfo(BaseModel):
@@ -60,6 +60,8 @@ class ProviderSearchInfo(BaseModel):
     imageUrl: Optional[str] = Field(None, description="封面图片URL")
     episodeCount: Optional[int] = Field(None, description="总集数")
     currentEpisodeIndex: Optional[int] = Field(None, description="如果搜索词指定了集数，则为当前集数")
+    url: Optional[str] = Field(None, description="平台播放页面URL")
+    supportsEpisodeUrls: Optional[bool] = Field(None, description="该源是否支持获取分集URL (用于补充源功能)")
 
 
 class ProviderSearchResponse(BaseModel):
@@ -87,11 +89,28 @@ class ImportRequest(BaseModel):
     doubanId: Optional[str] = None
     bangumiId: Optional[str] = None
     currentEpisodeIndex: Optional[int] = Field(None, description="如果搜索时指定了集数，则只导入此分集")
+    # 新增: 补充源信息
+    supplementProvider: Optional[str] = Field(None, description="补充源提供商 (如360), 用于获取分集列表")
+    supplementMediaId: Optional[str] = Field(None, description="补充源中的媒体ID")
+
+class TMDBSeasonInfo(BaseModel):
+    """TMDB季度信息模型"""
+    air_date: Optional[str] = Field(None, alias="airDate")
+    episode_count: int = Field(..., alias="episodeCount")
+    id: int
+    name: str
+    season_number: int = Field(..., alias="seasonNumber")
+    poster_path: Optional[str] = Field(None, alias="posterPath")
+    aliases: Optional[List[str]] = Field(default=[], description="季度别名列表")
+
+    class Config:
+        populate_by_name = True
 
 class MetadataDetailsResponse(BaseModel):
     """所有元数据源详情接口的统一响应模型。"""
     id: str
     title: str
+    type: Optional[str] = None
     tmdbId: Optional[str] = None
     imdbId: Optional[str] = None
     tvdbId: Optional[str] = None
@@ -101,8 +120,23 @@ class MetadataDetailsResponse(BaseModel):
     nameJp: Optional[str] = None
     nameRomaji: Optional[str] = None
     aliasesCn: List[str] = []
+    aliasesJp: List[str] = []  # 新增：日文别名列表
     imageUrl: Optional[str] = None
     details: Optional[str] = None
+    year: Optional[int] = None
+    supportsEpisodeUrls: Optional[bool] = Field(None, description="该源是否支持获取分集URL (用于补充源功能)")
+    seasons: Optional[List[TMDBSeasonInfo]] = Field(None, description="TMDB TV系列的季度信息列表")
+    extra: Optional[Dict[str, Any]] = Field(None, description="额外数据,用于存储原始搜索结果等信息")
+    provider: Optional[str] = Field(None, description="数据源提供方名称")
+
+class AnimeCreate(BaseModel):
+    """Model for creating a new anime entry manually."""
+    title: str = Field(..., description="作品标题")
+    type: str = Field("tv_series", description="作品类型 (tv_series, movie, ova, other)")
+    season: int = Field(1, description="季度")
+    year: Optional[int] = Field(None, description="年份")
+    imageUrl: Optional[str] = Field(None, description="海报图片URL")
+
 
 class AnimeDetailUpdate(BaseModel):
     """用于更新番剧详细信息的模型"""
@@ -124,12 +158,14 @@ class AnimeDetailUpdate(BaseModel):
     aliasCn1: Optional[str] = None
     aliasCn2: Optional[str] = None
     aliasCn3: Optional[str] = None
+    aliasLocked: Optional[bool] = Field(None, description="别名是否锁定")
 
 class EpisodeInfoUpdate(BaseModel):
     """用于更新分集信息的模型"""
     title: str = Field(..., min_length=1, description="新的分集标题")
     episodeIndex: int = Field(..., ge=1, description="新的集数")
     sourceUrl: Optional[str] = Field(None, description="新的官方链接")
+    danmakuFilePath: Optional[str] = Field(None, description="弹幕文件路径")
 
 class AnimeFullDetails(BaseModel):
     """用于返回番剧完整信息的模型"""
@@ -153,6 +189,12 @@ class AnimeFullDetails(BaseModel):
     aliasCn1: Optional[str] = None
     aliasCn2: Optional[str] = None
     aliasCn3: Optional[str] = None
+    aliasLocked: Optional[bool] = False
+
+class SourceCreate(BaseModel):
+    providerName: str = Field(..., description="数据源提供方名称")
+    mediaId: str = Field(..., description="在该数据源上的媒体ID")
+
 
 class SourceInfo(BaseModel):
     """代表一个已关联的数据源的详细信息。"""
@@ -174,11 +216,18 @@ class ScraperSetting(BaseModel):
 class MetadataSourceSettingUpdate(BaseModel):
     providerName: str
     isAuxSearchEnabled: bool
-    useProxy: bool
     displayOrder: int
 
 
 # --- 媒体库（弹幕情况）模型 ---
+class LibrarySourceBrief(BaseModel):
+    """媒体库列表中的简化源信息，用于快速操作标记和追更。"""
+    sourceId: int
+    providerName: str
+    isFavorited: bool
+    incrementalRefreshEnabled: bool
+
+
 class LibraryAnimeInfo(BaseModel):
     """代表媒体库中的一个番剧条目。"""
     animeId: int
@@ -191,9 +240,12 @@ class LibraryAnimeInfo(BaseModel):
     episodeCount: int
     sourceCount: int
     createdAt: datetime
+    sources: List[LibrarySourceBrief] = []  # 简化的源列表，用于快速操作
+
 
 class LibraryResponse(BaseModel):
-    animes: List[LibraryAnimeInfo]
+    total: int
+    list: List[LibraryAnimeInfo]
 
 # --- 分集管理模型 ---
 class EpisodeDetail(BaseModel):
@@ -203,6 +255,12 @@ class EpisodeDetail(BaseModel):
     sourceUrl: Optional[str] = None
     fetchedAt: Optional[datetime] = None
     commentCount: int
+    danmakuFilePath: Optional[str] = None
+
+class PaginatedEpisodesResponse(BaseModel):
+    """用于分集列表分页的响应模型"""
+    total: int
+    list: List[EpisodeDetail]
 
 # --- 任务管理器模型 ---
 class TaskInfo(BaseModel):
@@ -212,6 +270,13 @@ class TaskInfo(BaseModel):
     progress: int
     description: str
     createdAt: datetime
+    isSystemTask: bool = False
+    queueType: str = "download"  # 队列类型: "download"、"management" 或 "fallback"
+
+class PaginatedTasksResponse(BaseModel):
+    """用于任务列表分页的响应模型"""
+    total: int
+    list: List[TaskInfo]
 
 # --- API Token 管理模型 ---
 class ApiTokenInfo(BaseModel):
@@ -221,10 +286,13 @@ class ApiTokenInfo(BaseModel):
     isEnabled: bool
     expiresAt: Optional[datetime] = None
     createdAt: datetime
+    dailyCallLimit: int
+    dailyCallCount: int
 
 class ApiTokenCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=50, description="Token的描述性名称")
     validityPeriod: str = Field("permanent", description="有效期: permanent, 1d, 7d, 30d, 180d, 365d")
+    dailyCallLimit: int = Field(500, description="每日调用次数限制, -1 表示无限")
 
 # --- UA Filter Models ---
 class UaRule(BaseModel):
@@ -263,6 +331,11 @@ class PasswordChange(BaseModel):
     oldPassword: str = Field(..., description="当前密码")
     newPassword: str = Field(..., min_length=8, description="新密码 (至少8位)")
 
+class PaginatedCommentResponse(BaseModel):
+    """用于UI弹幕列表分页的响应模型"""
+    total: int
+    list: List[Comment]
+
 class BangumiAuthStatus(BaseModel):
     isAuthenticated: bool
     nickname: Optional[str] = None
@@ -291,6 +364,20 @@ class EditedImportRequest(BaseModel):
 class ControlUrlImportRequest(BaseModel):
     url: str
     provider: str
+
+class ManualImportRequest(BaseModel):
+    """用于手动导入单个分集的请求体模型"""
+    title: Optional[str] = None
+    episodeIndex: int
+    # 使用别名 'sourceUrl' 来兼容前端发送的字段
+    url: Optional[str] = Field(None, alias='sourceUrl')
+    content: Optional[str] = None
+
+    @model_validator(mode='after')
+    def check_url_or_content(self) -> "ManualImportRequest":
+        if not self.url and not self.content:
+            raise ValueError('必须提供 "url" 或 "content" 字段。')
+        return self
 
 class DanmakuOutputSettings(BaseModel):
     limit_per_source: int
@@ -326,22 +413,68 @@ class MetadataSourceStatusResponse(BaseModel):
     displayOrder: int
     status: str
     useProxy: bool
+    isFailoverEnabled: bool
+    logRawResponses: bool = Field(False, alias="log_raw_responses")
 
 class ScraperSettingWithConfig(ScraperSetting):
-    configurableFields: Optional[Dict[str, str]] = None
+    configurableFields: Optional[Dict[str, Union[str, Tuple[str, str, str], Dict[str, Any]]]] = None
     isLoggable: bool
-    isVerified: bool
+    version: Optional[str] = None  # 弹幕源版本号
 
 class ProxySettingsResponse(BaseModel):
-    proxyProtocol: str
+    proxyMode: str = "none"  # none, http_socks, accelerate
+    proxyProtocol: str = "http"
     proxyHost: Optional[str] = None
     proxyPort: Optional[int] = None
     proxyUsername: Optional[str] = None
     proxyPassword: Optional[str] = None
-    proxyEnabled: bool
+    proxyEnabled: bool = False  # 保留兼容性
+    accelerateProxyUrl: Optional[str] = None
 
 class ReassociationRequest(BaseModel):
     targetAnimeId: int
+
+class ConflictEpisode(BaseModel):
+    """冲突分集信息"""
+    episodeIndex: int
+    sourceEpisodeId: int
+    targetEpisodeId: int
+    sourceDanmakuCount: int
+    targetDanmakuCount: int
+    sourceLastFetchTime: Optional[datetime]
+    targetLastFetchTime: Optional[datetime]
+
+class ProviderConflict(BaseModel):
+    """提供商冲突信息"""
+    providerName: str
+    sourceSourceId: int
+    targetSourceId: int
+    conflictEpisodes: List[ConflictEpisode]
+
+class ReassociationConflictResponse(BaseModel):
+    """关联冲突检测响应"""
+    hasConflict: bool
+    conflicts: List[ProviderConflict]
+
+class EpisodeResolution(BaseModel):
+    """分集冲突解决方案"""
+    episodeIndex: int
+    keepSource: bool  # True=保留源分集, False=保留目标分集
+
+class ProviderResolution(BaseModel):
+    """提供商冲突解决方案"""
+    providerName: str
+    episodeResolutions: List[EpisodeResolution]
+    sourceOffset: int = 0  # 源番剧集数偏移
+
+class ReassociationResolveRequest(BaseModel):
+    """关联冲突解决请求"""
+    targetAnimeId: int
+    resolutions: List[ProviderResolution]
+
+class EpisodeOffsetRequest(BaseModel):
+    episodeIds: List[int]
+    offset: int
 
 class BulkDeleteEpisodesRequest(BaseModel):
     episodeIds: List[int]
@@ -361,21 +494,27 @@ class ScheduledTaskUpdate(BaseModel):
     isEnabled: bool
 
 class ScheduledTaskInfo(ScheduledTaskCreate):
-    id: str
+    taskId: str
     lastRunAt: Optional[datetime] = None
     nextRunAt: Optional[datetime] = None
+    isSystemTask: bool = False
 
 class AvailableJobInfo(BaseModel):
     jobType: str
     name: str
+    description: str = ""
+    isSystemTask: bool = False
 
 class ProxySettingsUpdate(BaseModel):
-    proxyProtocol: str
+    proxyMode: str = "none"  # none, http_socks, accelerate
+    proxyProtocol: str = "http"
     proxyHost: Optional[str] = None
-    proxyPort: Optional[int] = None
+    proxyPort: Optional[Union[int, str]] = None
     proxyUsername: Optional[str] = None
     proxyPassword: Optional[str] = None
-    proxyEnabled: bool
+    proxyEnabled: bool = False  # 保留兼容性
+    proxySslVerify: bool = Field(True, description="是否验证代理服务器的SSL证书")
+    accelerateProxyUrl: Optional[str] = None
 
 class UaRuleCreate(BaseModel):
     uaString: str
@@ -428,6 +567,16 @@ class EnrichedTMDBGroupInGroupDetail(BaseModel):
 class EnrichedTMDBEpisodeGroupDetails(TMDBEpisodeGroupDetails):
     groups: List[EnrichedTMDBGroupInGroupDetail]
 
+
+class BatchManualImportItem(BaseModel):
+    title: Optional[str] = Field(None, description="分集标题 (可选)")
+    episodeIndex: int = Field(..., gt=0, description="集数")
+    content: str = Field(..., description="URL或XML文件内容")
+
+class BatchManualImportRequest(BaseModel):
+    items: List[BatchManualImportItem]
+
+
 # --- Rate Limiter Models ---
 
 class RateLimitStatusItem(BaseModel):
@@ -448,5 +597,24 @@ class RateLimitStatusResponse(BaseModel):
     globalEnabled: bool
     providers: List[RateLimitStatusItem]
 
-# --- Rate Limiter Models ---
 
+class ControlRateLimitProviderStatus(BaseModel):
+    """用于外部API的单个流控规则状态"""
+    providerName: str
+    directCount: int = Field(0, description="直接下载计数")
+    fallbackCount: int = Field(0, description="后备调用计数")
+    requestCount: int = Field(0, description="总计数 (directCount + fallbackCount)")
+    quota: Union[int, str]
+
+class ControlRateLimitStatusResponse(BaseModel):
+    """用于外部API的流控状态响应模型"""
+    globalEnabled: bool
+    globalRequestCount: int
+    globalLimit: int
+    globalPeriod: str
+    secondsUntilReset: int
+    fallbackTotalCount: int = Field(0, description="后备调用总计数")
+    fallbackTotalLimit: int = Field(50, description="后备调用总限制")
+    fallbackMatchCount: int = Field(0, description="匹配后备计数")
+    fallbackSearchCount: int = Field(0, description="后备搜索计数")
+    providers: List[ControlRateLimitProviderStatus]
